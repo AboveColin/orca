@@ -53,12 +53,15 @@ export function SessionRowTrailingActions({
   onJumpToWorktree,
   onResume,
   onContinueInNewSession,
+  onResumeInNewChat,
   onCopyResume,
   onCopyId,
   onCopyPath,
   onOpenLog,
   onRevealLog,
-  onOpenCwd
+  onOpenCwd,
+  deleteBlockedReason,
+  onRequestDelete
 }: {
   session: AiVaultSession
   detailsExpanded: boolean
@@ -73,12 +76,17 @@ export function SessionRowTrailingActions({
   onJumpToWorktree?: () => void
   onResume: () => void
   onContinueInNewSession?: () => void
+  /** Passed through to the overflow menu only; the resting row keeps its two-icon budget. */
+  onResumeInNewChat?: () => void
   onCopyResume?: () => void
   onCopyId: () => void
   onCopyPath: () => void
   onOpenLog?: () => void
   onRevealLog?: () => void
   onOpenCwd?: () => void
+  // Null when Delete is offered; otherwise the tooltip explaining why it isn't.
+  deleteBlockedReason: string | null
+  onRequestDelete: () => void
 }) {
   const jumpToWorktreeTooltip = aiVaultWorktreeJumpTooltip(worktreeInfo)
 
@@ -251,6 +259,7 @@ export function SessionRowTrailingActions({
             resumeLabel={resumeLabel}
             onResume={onResume}
             onContinueInNewSession={onContinueInNewSession}
+            onResumeInNewChat={onResumeInNewChat}
             onJumpToOriginalPane={onJumpToOriginalPane}
             showJumpToWorktree={showJumpToWorktree}
             onJumpToWorktree={onJumpToWorktree}
@@ -260,6 +269,8 @@ export function SessionRowTrailingActions({
             onOpenLog={onOpenLog}
             onRevealLog={onRevealLog}
             onOpenCwd={onOpenCwd}
+            deleteBlockedReason={deleteBlockedReason}
+            onDelete={onRequestDelete}
           />
         </DropdownMenuContent>
       </DropdownMenu>

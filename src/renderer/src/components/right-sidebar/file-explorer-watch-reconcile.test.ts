@@ -6,17 +6,14 @@ import { useAppStore } from '@/store'
 
 function cacheWithChildren(paths: string[]): DirCache {
   return {
-    children: paths.map(
-      (path): TreeNode => ({
-        name: path.split(/[\\/]/).at(-1) ?? path,
-        path,
-        relativePath: path,
-        isDirectory: false,
-        depth: 0,
-        operationOwner: { kind: 'local' }
-      })
-    ),
-    loading: false,
+    children: paths.map((path): TreeNode => ({
+      name: path.split(/[\\/]/).at(-1) ?? path,
+      path,
+      relativePath: path,
+      isDirectory: false,
+      depth: 0,
+      operationOwner: { kind: 'local' }
+    })),
     operationOwner: { kind: 'local' }
   }
 }
@@ -434,8 +431,39 @@ describe('processFileExplorerFsPayload update reconciliation', () => {
     }
 
     expect(setDirCache).toHaveBeenCalledOnce()
-    expect(keyVisits).toBe(entryCount * 2)
+    // One scan, in purgeDirCacheSubtrees. The casing-fallback index stays unbuilt because every
+    // lookup here hits `dirPath in cache` directly.
+    expect(keyVisits).toBe(entryCount)
     expect(expandedPathReads).toBe(expandedPaths.length)
     expect(remainingExpanded).toEqual(new Set())
+  })
+})
+
+describe('processFileExplorerFsPayload overflow reconciliation', () => {
+  it('routes an overflow event to a single tree refresh and skips per-dir refreshes', () => {
+    const root = '/repo'
+    const refreshDir = vi.fn()
+    const refreshTree = vi.fn()
+    processFileExplorerFsPayload({
+      payload: {
+        worktreePath: root,
+        events: [
+          { kind: 'create', absolutePath: `${root}/a.txt` },
+          { kind: 'overflow', absolutePath: root },
+          { kind: 'create', absolutePath: `${root}/src/b.txt` }
+        ]
+      },
+      currentWorktreePath: root,
+      worktreeId: 'wt-1',
+      cache: { [root]: cacheWithChildren([]), [`${root}/src`]: cacheWithChildren([]) },
+      expanded: new Set([`${root}/src`]),
+      setDirCache: vi.fn(),
+      setSelectedPath: vi.fn(),
+      refreshDir,
+      refreshTree
+    })
+
+    expect(refreshTree).toHaveBeenCalledOnce()
+    expect(refreshDir).not.toHaveBeenCalled()
   })
 })

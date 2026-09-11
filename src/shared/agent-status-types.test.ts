@@ -1,8 +1,10 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import {
   agentSubagentsEqual,
+  isFreshNonDoneAgentStatus,
   parseAgentStatusPayload,
   normalizeAgentStatusPayload,
+  pickParsedAgentStatusPayload,
   AGENT_STATUS_JSON_STRUCTURE_LIMITS,
   AGENT_STATUS_MAX_FIELD_LENGTH,
   AGENT_STATUS_MAX_SUBAGENTS,
@@ -13,9 +15,31 @@ import {
   AGENT_STATUS_STATES,
   AGENT_TYPE_MAX_LENGTH
 } from './agent-status-types'
+import type { AgentType, WellKnownAgentType } from './agent-status-types'
+import type { TuiAgent } from './tui-agent'
 
 afterEach(() => {
   vi.restoreAllMocks()
+})
+
+describe('isFreshNonDoneAgentStatus', () => {
+  it('treats a within-TTL working entry as fresh', () => {
+    expect(isFreshNonDoneAgentStatus({ state: 'working', updatedAt: 1_000 }, 2_000)).toBe(true)
+  })
+
+  it('never treats a restored-unconfirmed entry as fresh, regardless of age', () => {
+    expect(
+      isFreshNonDoneAgentStatus(
+        { state: 'working', updatedAt: 1_999, restoredUnconfirmed: true },
+        2_000
+      )
+    ).toBe(false)
+  })
+
+  it('stays false for done and for stale entries', () => {
+    expect(isFreshNonDoneAgentStatus({ state: 'done', updatedAt: 2_000 }, 2_000)).toBe(false)
+    expect(isFreshNonDoneAgentStatus({ state: 'working', updatedAt: 0 }, 10_000, 5_000)).toBe(false)
+  })
 })
 
 describe('parseAgentStatusPayload', () => {
@@ -36,6 +60,19 @@ describe('parseAgentStatusPayload', () => {
       expect(result).not.toBeNull()
       expect(result!.state).toBe(state)
     }
+  })
+
+  it('accepts monitoring only as an optional working discriminator', () => {
+    expect(parseAgentStatusPayload('{"state":"working","workingMode":"monitoring"}')).toMatchObject(
+      { state: 'working', workingMode: 'monitoring' }
+    )
+    expect(
+      parseAgentStatusPayload('{"state":"done","workingMode":"monitoring"}')?.workingMode
+    ).toBeUndefined()
+    expect(
+      parseAgentStatusPayload('{"state":"working","workingMode":"unknown"}')?.workingMode
+    ).toBeUndefined()
+    expect(parseAgentStatusPayload('{"state":"working"}')?.workingMode).toBeUndefined()
   })
 
   it('returns null for invalid state', () => {
@@ -400,6 +437,55 @@ Fix dispatch fallback preview for normalized status prompts`
     }
   })
 
+  it('preserves sessionBoundary=true only on done (stale-signal suppression like interrupted)', () => {
+    expect(
+      parseAgentStatusPayload('{"state":"done","sessionBoundary":true}')!.sessionBoundary
+    ).toBe(true)
+    for (const state of ['working', 'blocked', 'waiting'] as const) {
+      const result = parseAgentStatusPayload(`{"state":"${state}","sessionBoundary":true}`)
+      expect(result!.sessionBoundary).toBeUndefined()
+    }
+    // Why: parser uses `=== true`, so truthy sentinels don't count.
+    expect(
+      parseAgentStatusPayload('{"state":"done","sessionBoundary":"true"}')!.sessionBoundary
+    ).toBeUndefined()
+  })
+
+  it('keeps turnCompletedAt on the gated working row and its all-clear done, nowhere else', () => {
+    for (const state of ['working', 'done'] as const) {
+      expect(
+        parseAgentStatusPayload(`{"state":"${state}","turnCompletedAt":1767225601000}`)!
+          .turnCompletedAt
+      ).toBe(1767225601000)
+    }
+    for (const state of ['blocked', 'waiting'] as const) {
+      expect(
+        parseAgentStatusPayload(`{"state":"${state}","turnCompletedAt":1767225601000}`)!
+          .turnCompletedAt
+      ).toBeUndefined()
+    }
+    for (const raw of ['"1767225601000"', 'null', 'true']) {
+      expect(
+        parseAgentStatusPayload(`{"state":"done","turnCompletedAt":${raw}}`)!.turnCompletedAt
+      ).toBeUndefined()
+    }
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(
+        normalizeAgentStatusPayload({ state: 'done', turnCompletedAt: value })!.turnCompletedAt
+      ).toBeUndefined()
+    }
+  })
+
+  it('carries turnCompletedAt through the client-visible payload projection', () => {
+    expect(
+      pickParsedAgentStatusPayload({
+        state: 'working',
+        prompt: 'run the build',
+        turnCompletedAt: 1767225601000
+      }).turnCompletedAt
+    ).toBe(1767225601000)
+  })
+
   it('requires strict boolean true for interrupted (rejects truthy non-boolean)', () => {
     // Why: parser uses `=== true`, so truthy string/number sentinels don't count.
     expect(
@@ -462,6 +548,7 @@ Fix dispatch fallback preview for normalized status prompts`
         subagents: [
           { id: 'a1', state: 'working', startedAt: 100, agentType: 'general-purpose' },
           { id: 'r1', state: 'idle', startedAt: 'nope', description: 'line\none' },
+          { id: 'u1', state: 'unverifiable', startedAt: 200 },
           { id: '', state: 'working', startedAt: 1 },
           { id: 'bad-state', state: 'running', startedAt: 1 },
           'garbage',
@@ -488,6 +575,7 @@ Fix dispatch fallback preview for normalized status prompts`
       startedAt: 0,
       description: 'line one'
     })
+    expect(result?.subagents?.[2]).toMatchObject({ id: 'u1', state: 'unverifiable' })
   })
 
   it('omits subagents when absent or empty', () => {
@@ -515,7 +603,14 @@ describe('agentSubagentsEqual', () => {
 // they used to take, including where stringify would have altered the payload.
 describe('normalizeAgentStatusPayload matches the JSON round trip', () => {
   const CASES: Record<string, unknown>[] = [
-    { state: 'working', prompt: 'p', agentType: 'grok', toolName: 'sh', toolInput: 'ls' },
+    {
+      state: 'working',
+      workingMode: 'monitoring',
+      prompt: 'p',
+      agentType: 'grok',
+      toolName: 'sh',
+      toolInput: 'ls'
+    },
     { state: 'done', prompt: '', agentType: 'devin', interrupted: true },
     // stringify DROPS undefined-valued keys; the direct path passes them through
     {
@@ -581,5 +676,34 @@ describe('normalizeAgentStatusPayload matches the JSON round trip', () => {
         value: parseAgentStatusPayload(JSON.stringify(payload))
       })
     }
+  })
+})
+
+describe('WellKnownAgentType', () => {
+  // Compile-time proof the union is derived from TuiAgent rather than hand-copied:
+  // a literal list that misses any launchable agent id fails to typecheck here.
+  const widenTuiAgent = (agent: TuiAgent): WellKnownAgentType => agent
+
+  it('covers every TuiAgent id plus the unknown sentinel', () => {
+    // ids the previous 22-member hand-written union had drifted past
+    const formerlyMissing: WellKnownAgentType[] = [
+      'qwen-code',
+      'mistral-vibe',
+      'claude-agent-teams'
+    ]
+    const sentinel: WellKnownAgentType = 'unknown'
+
+    expect([...formerlyMissing, sentinel, widenTuiAgent('rovo')]).toEqual([
+      'qwen-code',
+      'mistral-vibe',
+      'claude-agent-teams',
+      'unknown',
+      'rovo'
+    ])
+  })
+
+  it('keeps AgentType open to custom agent names', () => {
+    const custom: AgentType = 'some-in-house-agent'
+    expect(custom).toBe('some-in-house-agent')
   })
 })

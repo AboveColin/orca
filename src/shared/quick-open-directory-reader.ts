@@ -1,4 +1,5 @@
 import { lstat, opendir } from 'node:fs/promises'
+import { compareFileNames } from './file-name-sort'
 import { isFileListingCancellation, throwIfFileListingCancelled } from './file-listing-cancellation'
 import { isQuickOpenReadableDirectory } from './quick-open-directory-validation'
 import {
@@ -28,25 +29,31 @@ export async function readQuickOpenDirectoryEntries(opts: {
 
     const entries: QuickOpenDirectoryEntry[] = []
     const directory = await opendir(opts.absPath)
-    throwIfFileListingCancelled(opts.signal)
-    assertQuickOpenReaddirDeadline(opts.budget)
-    for await (const entry of directory) {
+    try {
       throwIfFileListingCancelled(opts.signal)
       assertQuickOpenReaddirDeadline(opts.budget)
-      consumeQuickOpenReaddirEntryBudget(opts.budget)
-      consumeQuickOpenReaddirPathBudget(opts.budget, entry.name)
-      entries.push({
-        name: entry.name,
-        kind: entry.isDirectory()
-          ? 'directory'
-          : entry.isFile()
-            ? 'file'
-            : entry.isSymbolicLink()
-              ? 'symlink'
-              : 'other'
-      })
+      for await (const entry of directory) {
+        throwIfFileListingCancelled(opts.signal)
+        assertQuickOpenReaddirDeadline(opts.budget)
+        consumeQuickOpenReaddirEntryBudget(opts.budget)
+        consumeQuickOpenReaddirPathBudget(opts.budget, entry.name)
+        entries.push({
+          name: entry.name,
+          kind: entry.isDirectory()
+            ? 'directory'
+            : entry.isFile()
+              ? 'file'
+              : entry.isSymbolicLink()
+                ? 'symlink'
+                : 'other'
+        })
+      }
+    } finally {
+      try {
+        await directory.close()
+      } catch {}
     }
-    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+    entries.sort((left, right) => compareFileNames(left.name, right.name))
 
     // Why: discard buffered names if the path became a symlink while its
     // directory handle was open; descendants must never escape the root.

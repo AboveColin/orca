@@ -15,6 +15,9 @@ export type SftpWriteCapture = {
 
 type SftpCallback = (err: Error | null, resolved?: string) => void
 const NO_SUCH_SFTP_FILE = Object.assign(new Error('No such file'), { code: 2 })
+// Stdout of the relay-side pty-master cloexec patch; kept as a literal so the fixture states the
+// wire token it is standing in for rather than importing the module under test.
+const NODE_PTY_CLOEXEC_STATUS_PREFIX = 'ORCA-NPTY-CLOEXEC:'
 
 export function makeMockConnection(capture: SftpWriteCapture): SshConnection {
   // Why: production attaches/removes real listeners (including prependOnceListener), so the fake must be an emitter.
@@ -54,15 +57,35 @@ export function makeMockConnection(capture: SftpWriteCapture): SshConnection {
 
 export type ExecResponse = string | { reject: string }
 
-// Repair reconnect (isRelayAlreadyInstalled → true) where BOTH native deps are broken and the host
-// cannot compile node-pty, so the caller's resets must survive into the node-pty-less reinstall.
-export function makeRepairToolchainSkipExecResponses(): ExecResponse[] {
-  const bothMissing = 'ORCA-NATIVE-DEPS-MISSING:node-pty,@parcel/watcher\nMISSING'
+// The answer a genuinely broken pair produces: a marker line naming both deps. A bare `MISSING`
+// names none, so it is unverifiable and must never stand in for this.
+export const BOTH_NATIVE_DEPS_MISSING_PROBE =
+  'ORCA-NATIVE-DEPS-MISSING:node-pty,@parcel/watcher\nMISSING'
+
+const STAGE_OWNER = '.sftp-namespace-00000000000000000000000000000000'
+
+export function makeStagedFirstInstallExecPrefix(): ExecResponse[] {
   return [
     '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
     '/home/u',
-    bothMissing, // health probe before lock
-    bothMissing, // re-probe under the repair lock
+    '', // bounded stale-stage recovery
+    `__ORCA_UPLOAD_STAGE_SLOT__${STAGE_OWNER}:slot-0`,
+    '', // chmod staged node
+    '', // final install namespace marker
+    `__ORCA_UPLOAD_STAGE_PROMOTION__${STAGE_OWNER}:PROMOTED`,
+    // Shared native-deps cache probe; an empty answer is a miss, so the per-directory install runs.
+    ''
+  ]
+}
+
+// Repair reconnect (isRelayAlreadyInstalled → true) where BOTH native deps are broken and the host
+// cannot compile node-pty, so the caller's resets must survive into the node-pty-less reinstall.
+export function makeRepairToolchainSkipExecResponses(): ExecResponse[] {
+  return [
+    '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+    '/home/u',
+    BOTH_NATIVE_DEPS_MISSING_PROBE, // health probe before lock
+    BOTH_NATIVE_DEPS_MISSING_PROBE, // re-probe under the repair lock
     '', // SFTP-namespace install-owner marker (repair)
     { reject: 'gyp ERR! stack Error: not found: make' },
     'PKG apk', // toolchain probe: no HAVE lines
@@ -108,32 +131,28 @@ export function makeExecResponses(opts: {
   // reinstall succeeds; only then are the chmod/probe/launch slots reached.
   if (opts.npmInstall !== 'ok' && opts.nodePtySkipRetry !== 'ok') {
     return [
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
-      '/home/u',
-      '', // mkdir remoteDir (uploadRelay)
-      '', // chmod +x node
+      ...makeStagedFirstInstallExecPrefix(),
       opts.npmInstall, // npm install rejects
       opts.toolchainProbe ?? 'HAVE make\nHAVE g++\nHAVE cc\nHAVE python3\nPKG apt-get',
-      ...(opts.nodePtySkipRetry ? [opts.nodePtySkipRetry] : []) // reinstall also rejects
+      ...(opts.nodePtySkipRetry ? [opts.nodePtySkipRetry] : []), // reinstall also rejects
+      '' // clean stage root
     ]
   }
   if (opts.npmInstall !== 'ok') {
     // Skip path, exactly as production runs it: no chmod-prebuilds (node-pty is gone) and no rebuild
     // (it provably can't compile here). The probe still runs to catch a dead @parcel/watcher.
     return [
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
-      '/home/u',
-      '', // mkdir remoteDir (uploadRelay)
-      '', // chmod +x node
+      ...makeStagedFirstInstallExecPrefix(),
       opts.npmInstall, // npm install rejects on the missing compiler
       opts.toolchainProbe ?? 'HAVE python3\nPKG dnf',
       '', // rm -rf node-pty + reinstall without it
       // node-pty is always reported missing here; the probe never resolves OK, so cat + rm both run.
       opts.nodePtySkipWatcher === 'missing'
-        ? 'ORCA-NATIVE-DEPS-MISSING:node-pty,@parcel/watcher\nMISSING\n'
+        ? `${BOTH_NATIVE_DEPS_MISSING_PROBE}\n`
         : 'ORCA-NATIVE-DEPS-MISSING:node-pty\nMISSING\n',
       '', // cat probe stderr
       '', // rm -f probe stderr
+      '', // clean stage root
       'DEAD',
       '', // publish the per-launch credential
       'READY'
@@ -151,18 +170,17 @@ export function makeExecResponses(opts: {
             ? { reject: 'cd: no such file or directory' }
             : probe
   const slots: ExecResponse[] = [
-    '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
-    '/home/u',
-    '', // mkdir remoteDir (uploadRelay)
-    '', // chmod +x node
+    ...makeStagedFirstInstallExecPrefix(),
     '', // npm install native deps
     '', // chmod prebuilds
     probeSlot
   ]
   // Cleanup execs only run when the probe resolved (not when it rejected).
   const probeResolved = typeof probeSlot === 'string'
+  let loadable = false
   if (probeResolved) {
     const probeOk = probeSlot.includes('ORCA-NPTY-PROBE-OK')
+    loadable = probeOk
     if (!probeOk) {
       slots.push('') // cat stderr (graceful failure path captures detail)
     }
@@ -172,12 +190,20 @@ export function makeExecResponses(opts: {
       slots.push('') // chmod prebuilds after rebuild
       const repairProbe = opts.repairProbe === 'ok' ? 'ORCA-NPTY-PROBE-OK\n' : 'MISSING\n'
       slots.push(repairProbe)
-      if (!repairProbe.includes('ORCA-NPTY-PROBE-OK')) {
+      loadable = repairProbe.includes('ORCA-NPTY-PROBE-OK')
+      if (!loadable) {
         slots.push('') // cat stderr after unsuccessful rebuild
       }
       slots.push('') // rm -f stderr after rebuild probe
     }
   }
-  slots.push('DEAD', '', 'READY')
+  // Publication is gated on the probe: only a tree this host actually loaded is shared.
+  if (loadable) {
+    // The cloexec patch runs first, and publication is gated on its status, so `patched` is what
+    // makes the promote exec below reachable at all.
+    slots.push(`${NODE_PTY_CLOEXEC_STATUS_PREFIX}patched\n`)
+    slots.push('') // promote the private tree into the shared native-deps cache
+  }
+  slots.push('', 'DEAD', '', 'READY') // clean stage root, launch, credential, readiness
   return slots
 }

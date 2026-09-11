@@ -97,6 +97,14 @@ function makeStore(enabled = true) {
   }
 }
 
+// These cases exercise foreground behavior against Electron mocks.
+beforeEach(() => {
+  vi.stubEnv('ORCA_BACKGROUND_LAUNCH', undefined)
+  vi.stubEnv('ORCA_E2E_HEADLESS', undefined)
+  vi.stubEnv('ORCA_E2E_HEADFUL', undefined)
+})
+afterEach(() => vi.unstubAllEnvs())
+
 describe('registerDashboardPopoutHandlers', () => {
   let store: ReturnType<typeof makeStore>
 
@@ -127,6 +135,15 @@ describe('registerDashboardPopoutHandlers', () => {
     expect(createPopoutMock).toHaveBeenCalledWith(store, undefined, {
       getKeybindings: expect.any(Function)
     })
+
+    handlers.get('dashboardPopout:open')!({ sender: mainSender } as never, 'map')
+    expect(createPopoutMock).toHaveBeenLastCalledWith(store, 'map', {
+      getKeybindings: expect.any(Function)
+    })
+
+    createPopoutMock.mockClear()
+    handlers.get('dashboardPopout:open')!({ sender: mainSender } as never, 'invalid')
+    expect(createPopoutMock).not.toHaveBeenCalled()
   })
 
   it('auto-closes the popout when the feature is disabled', () => {
@@ -238,6 +255,31 @@ describe('registerDashboardPopoutHandlers', () => {
       paneKey: 'tab1:leaf1'
     })
     expect(sendToTrustedMock).toHaveBeenCalledWith('ui:ackDashboardAgent', 'tab1:leaf1')
+  })
+
+  it('relays only valid agent launches from the popout', () => {
+    const args = { worktreeId: 'worktree-1', agent: 'codex' }
+    handlers.get('dashboardPopout:spawnAgent')!({ sender: untrustedSender } as never, args)
+    handlers.get('dashboardPopout:spawnAgent')!({ sender: popoutSender } as never, {
+      ...args,
+      agent: 'unknown'
+    })
+    expect(sendToTrustedMock).not.toHaveBeenCalled()
+
+    handlers.get('dashboardPopout:spawnAgent')!({ sender: popoutSender } as never, args)
+    expect(sendToTrustedMock).toHaveBeenCalledWith('ui:spawnDashboardAgent', args)
+  })
+
+  it('relays only valid sleep requests from the popout', () => {
+    const args = { worktreeId: 'worktree-1' }
+    handlers.get('dashboardPopout:sleepWorkspace')!({ sender: untrustedSender } as never, args)
+    handlers.get('dashboardPopout:sleepWorkspace')!({ sender: popoutSender } as never, {
+      worktreeId: ''
+    })
+    expect(sendToTrustedMock).not.toHaveBeenCalled()
+
+    handlers.get('dashboardPopout:sleepWorkspace')!({ sender: popoutSender } as never, args)
+    expect(sendToTrustedMock).toHaveBeenCalledWith('ui:sleepDashboardWorkspace', args)
   })
 
   it('reveals an agent in only the trusted main window', () => {

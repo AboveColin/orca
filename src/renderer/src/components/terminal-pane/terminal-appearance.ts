@@ -1,6 +1,6 @@
 import type { ITheme } from '@xterm/xterm'
 import type { PaneManager } from '@/lib/pane-manager/pane-manager'
-import type { GlobalSettings } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
 import { resolveTerminalFontWeights } from '../../../../shared/terminal-fonts'
 import { resolveTerminalLigaturesEnabled } from '../../../../shared/terminal-ligatures'
 import {
@@ -10,12 +10,18 @@ import {
 } from '@/lib/terminal-theme'
 import { buildFontFamily } from './layout-serialization'
 import { safeFit, safeFitAndThen } from '@/lib/pane-manager/pane-tree-ops'
+import { canApplyPaneMetricOptions } from '@/lib/pane-manager/pane-fit'
+import {
+  applyOrDeferPaneMetricOptions,
+  paneMetricOptionsAlreadySettled
+} from '@/lib/pane-manager/pane-metric-options-deferral'
 import {
   normalizeTerminalFastScrollSensitivity,
   normalizeTerminalScrollSensitivity,
   resolveTerminalCursorInactiveStyle
 } from '@/lib/pane-manager/pane-terminal-options'
 import { getFitOverrideForPty } from '@/lib/pane-manager/mobile-fit-overrides'
+import { setTerminalCursorBlinkOption } from '@/lib/pane-manager/pane-cursor-blink-suspension'
 import type { PtyTransport } from './pty-transport'
 import type { EffectiveMacOptionAsAlt } from '@/lib/keyboard-layout/detect-option-as-alt'
 import { HEX_COLOR_RE } from '../../../../shared/color-validation'
@@ -145,7 +151,10 @@ export function applyTerminalAppearance(
   publishTerminalViewAttributes(theme, appearance.mode, settings)
   const paneBackground = theme?.background ?? '#000000'
 
-  const terminalFontWeights = resolveTerminalFontWeights(settings.terminalFontWeight)
+  const terminalFontWeights = resolveTerminalFontWeights(
+    settings.terminalFontWeight,
+    settings.terminalFontWeightBold
+  )
   const ligaturesEnabled = resolveTerminalLigaturesEnabled(
     settings.terminalLigatures,
     settings.terminalFontFamily
@@ -161,7 +170,8 @@ export function applyTerminalAppearance(
     // Why value-gated: writing minimumContrastRatio clears xterm's contrast cache, so skip on no-op re-applies.
     const minimumContrastRatio = resolveTerminalMinimumContrastRatio(
       theme?.background,
-      appearance.mode
+      appearance.mode,
+      settings.terminalMinimumContrastRatio
     )
     if (pane.terminal.options.minimumContrastRatio !== minimumContrastRatio) {
       pane.terminal.options.minimumContrastRatio = minimumContrastRatio
@@ -172,12 +182,25 @@ export function applyTerminalAppearance(
     const cursorStyle = settings.terminalCursorStyle ?? 'block'
     pane.terminal.options.cursorStyle = cursorStyle
     pane.terminal.options.cursorInactiveStyle = resolveTerminalCursorInactiveStyle(cursorStyle)
-    pane.terminal.options.cursorBlink = settings.terminalCursorBlink
+    // Why not a direct write: a suspended (hidden) pane parks the value instead, so a
+    // settings change mid-hide cannot re-arm its blink timer behind the hidden surface.
+    setTerminalCursorBlinkOption(pane.terminal, settings.terminalCursorBlink)
     const paneSize = paneFontSizes.get(pane.id)
-    pane.terminal.options.fontSize = paneSize ?? settings.terminalFontSize
-    pane.terminal.options.fontFamily = buildFontFamily(settings.terminalFontFamily)
-    pane.terminal.options.fontWeight = terminalFontWeights.fontWeight
-    pane.terminal.options.fontWeightBold = terminalFontWeights.fontWeightBold
+    const metricOptions = {
+      fontSize: paneSize ?? settings.terminalFontSize,
+      fontFamily: buildFontFamily(settings.terminalFontFamily),
+      fontWeight: terminalFontWeights.fontWeight,
+      fontWeightBold: terminalFontWeights.fontWeightBold,
+      lineHeight: normalizeTerminalLineHeight(settings.terminalLineHeight)
+    }
+    // Why value-gated: any settings write re-runs this over every mounted pane, and
+    // canApplyPaneMetricOptions forces style+layout; an unchanged no-op deferral
+    // would also arm a pointless refit on the next reveal.
+    // Why deferred: a metric write makes xterm clear/resize/full-refresh, which is
+    // wasted on a pane with no usable box and whose follow-up cols/rows fit can't run.
+    if (!paneMetricOptionsAlreadySettled(pane, metricOptions)) {
+      applyOrDeferPaneMetricOptions(pane, metricOptions, canApplyPaneMetricOptions(pane))
+    }
     pane.terminal.options.scrollSensitivity = normalizeTerminalScrollSensitivity(
       settings.terminalScrollSensitivity
     )
@@ -186,7 +209,6 @@ export function applyTerminalAppearance(
     )
     // Why only 'true': 'left'/'right' are handled in the keydown policy, which needs Option composable at the xterm level.
     pane.terminal.options.macOptionIsMeta = effectiveMacOptionAsAlt === 'true'
-    pane.terminal.options.lineHeight = normalizeTerminalLineHeight(settings.terminalLineHeight)
     // Why unconditional: the helper no-ops when addon state already matches, so this keeps new panes and live toggles in sync.
     manager.setPaneLigaturesEnabled(pane.id, ligaturesEnabled)
     const transport = paneTransports.get(pane.id)

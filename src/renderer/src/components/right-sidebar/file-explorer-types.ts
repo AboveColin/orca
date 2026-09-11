@@ -17,8 +17,17 @@ export type TreeNode = {
   operationOwner?: FileExplorerOperationOwner
 }
 
+/** Why no `loading` here: see file-explorer-loading-dirs.ts — identity changes re-walk the tree. */
 export type DirCache = {
   children: TreeNode[]
-  loading: boolean
   operationOwner?: FileExplorerOperationOwner
 }
+
+/**
+ * How a full tree refresh ended.
+ *
+ * Why three states, not a boolean: a caller that dropped its own pending dir refreshes because the
+ * tree refresh covered them must re-issue on `superseded` (someone newer owns those reads) but NOT
+ * on `root-unreadable` — there the transport is down, and re-issuing buys one dead timeout per dir.
+ */
+export type FileExplorerTreeRefreshOutcome = 'refreshed' | 'superseded' | 'root-unreadable'

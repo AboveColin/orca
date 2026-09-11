@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { getDefaultWorkspaceSession } from '../../shared/constants'
+import { LOCAL_EXECUTION_HOST_ID } from '../../shared/execution-host'
 import type {
   RuntimeMobileSessionTabsResult,
   RuntimeMobileSessionTabsSnapshot
 } from '../../shared/runtime-types'
-import type { WorkspaceSessionState } from '../../shared/types'
+import type { WorkspaceSessionState } from '../../shared/workspace-session-state-types'
 import { sanitizeWorkspaceSessionTerminalRetirements } from './mobile-session-terminal-persistence-retirement'
 import { OrcaRuntimeService } from './orca-runtime'
 
@@ -215,11 +216,26 @@ describe('OrcaRuntimeService terminal surface retirement', () => {
     runtime.attachWindow(1)
     const staleSnapshot = makeSplitSnapshot()
     syncSplit(runtime, staleSnapshot)
+    const leftBeforeExit = (await runtime.listMobileSessionTabs(`id:${WORKTREE_ID}`)).tabs.find(
+      (tab) => tab.type === 'terminal' && tab.id === 'tab::left'
+    )
+    const leftHandle =
+      leftBeforeExit?.type === 'terminal' && leftBeforeExit.status === 'ready'
+        ? leftBeforeExit.terminal
+        : null
 
     runtime.onPtyExit('pty-left', 0)
 
     expect(await runtime.listMobileSessionTabs(`id:${WORKTREE_ID}`)).toMatchObject({
       activeTabId: 'tab::right',
+      retiredTerminalSurfaces: [
+        {
+          parentTabId: 'tab',
+          leafId: 'left',
+          ptyId: 'pty-left',
+          terminal: leftHandle
+        }
+      ],
       tabs: [
         {
           id: 'tab::right',
@@ -531,7 +547,8 @@ describe('OrcaRuntimeService terminal surface retirement', () => {
             ptyIdsByLeafId: { right: 'pty-right' }
           })
         }
-      })
+      }),
+      LOCAL_EXECUTION_HOST_ID
     )
   })
 
@@ -659,7 +676,8 @@ describe('OrcaRuntimeService terminal surface retirement', () => {
         },
         terminalSurfaceTombstonesByPaneKey: {},
         terminalTopologyRevisionByRepoId: { [REPO_ID]: 1 }
-      })
+      }),
+      LOCAL_EXECUTION_HOST_ID
     )
     expect(flushOrThrow).toHaveBeenCalledOnce()
   })
@@ -699,5 +717,35 @@ describe('OrcaRuntimeService terminal surface retirement', () => {
     )
     unsubscribe()
     errorSpy.mockRestore()
+  })
+
+  it('rolls back an in-memory retirement when the durable flush fails', async () => {
+    let session = makePersistedSplitSession()
+    const original = structuredClone(session)
+    const setWorkspaceSession = vi.fn((next: WorkspaceSessionState) => {
+      session = next
+    })
+    const runtime = new OrcaRuntimeService(
+      runtimeStore({
+        getWorkspaceSession: () => session,
+        setWorkspaceSession,
+        flushOrThrow: vi.fn(() => {
+          throw new Error('disk unavailable')
+        })
+      })
+    )
+    runtime.attachWindow(1)
+    syncSplit(runtime)
+    runtime.registerPty('pty-left', WORKTREE_ID, null, {
+      tabId: 'tab',
+      leafId: 'left',
+      incarnationId: 'incarnation-a'
+    })
+
+    runtime.onPtyExit('pty-left', 0, 'incarnation-a')
+
+    expect(session).toEqual(original)
+    expect(setWorkspaceSession).toHaveBeenLastCalledWith(original, LOCAL_EXECUTION_HOST_ID)
+    expect(setWorkspaceSession).toHaveBeenCalledTimes(2)
   })
 })

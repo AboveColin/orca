@@ -140,6 +140,7 @@ import {
   isDashboardPopoutRenderer,
   zoomDashboardPopoutIfFocused
 } from './dashboard-popout-window'
+import { readBrowserClientHostIdArgument } from '../../shared/browser-client-host-id-argument'
 
 type FakeWindow = InstanceType<typeof BrowserWindowMock>
 
@@ -169,6 +170,14 @@ function makeStore(ui: Record<string, unknown> = {}): {
 }
 
 const RENDERER_URL = 'http://localhost:5173'
+
+// These cases exercise foreground behavior against Electron mocks.
+beforeEach(() => {
+  vi.stubEnv('ORCA_BACKGROUND_LAUNCH', undefined)
+  vi.stubEnv('ORCA_E2E_HEADLESS', undefined)
+  vi.stubEnv('ORCA_E2E_HEADFUL', undefined)
+})
+afterEach(() => vi.unstubAllEnvs())
 
 describe('createOrFocusDashboardPopout', () => {
   beforeEach(() => {
@@ -201,6 +210,11 @@ describe('createOrFocusDashboardPopout', () => {
     expect(opts.webPreferences?.partition).toBe('orca-dashboard-popout')
     expect(opts.webPreferences?.webviewTag).toBe(false)
     expect(opts.webPreferences?.preload).toMatch(/preload[\\/]index\.js$/)
+    // Why unstamped: no guest of ours can run here, so this renderer hosts no client-placed page
+    // and must keep mirroring what the host publishes for every one of them.
+    expect(
+      readBrowserClientHostIdArgument(opts.webPreferences?.additionalArguments ?? [])
+    ).toBeNull()
     expect(installNavigationPolicyMock).toHaveBeenCalledWith(instances[0].webContents)
     const { session } = instances[0].webContents
     expect(session.setPermissionRequestHandler).toHaveBeenCalledTimes(1)
@@ -231,6 +245,12 @@ describe('createOrFocusDashboardPopout', () => {
     expect(options).toEqual({ search: 'view=kanban' })
   })
 
+  it('opens on the current dashboard view by default', () => {
+    createOrFocusDashboardPopout(makeStore() as never)
+
+    expect(instances[0].loadFile.mock.calls[0][1]).toEqual({ search: 'view=board' })
+  })
+
   it('loads the dev server URL with the requested view when in dev', () => {
     isMock.dev = true
     vi.stubEnv('ELECTRON_RENDERER_URL', RENDERER_URL)
@@ -247,6 +267,16 @@ describe('createOrFocusDashboardPopout', () => {
     expect(instances).toHaveLength(1)
     expect(second).toBe(first)
     expect(instances[0].focus).toHaveBeenCalledTimes(1)
+  })
+
+  it('switches an existing popout to an explicitly requested view', () => {
+    const store = makeStore()
+    createOrFocusDashboardPopout(store as never)
+    const win = instances[0]
+
+    createOrFocusDashboardPopout(store as never, 'map')
+
+    expect(win.webContents.send).toHaveBeenCalledWith('dashboard:viewRequested', 'map')
   })
 
   it('trusts only the live popout webContents', () => {

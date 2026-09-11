@@ -1,7 +1,8 @@
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
 import { useAppStore } from '@/store'
 import type { DashboardSnapshot } from '../../../../shared/dashboard-snapshot'
 import { buildDashboardSnapshot } from './build-dashboard-snapshot'
+import { createWorktreeAgentRowsCache } from './worktree-agent-rows-cache'
 
 /**
  * Builds the dashboard snapshot directly from the live renderer store for the
@@ -10,9 +11,12 @@ import { buildDashboardSnapshot } from './build-dashboard-snapshot'
  * is no relay, so we derive it here from the same builder the bridge uses.
  */
 export function useLiveDashboardSnapshot(): DashboardSnapshot {
+  const rowsCacheRef = useRef<ReturnType<typeof createWorktreeAgentRowsCache>>(undefined!)
+  rowsCacheRef.current ??= createWorktreeAgentRowsCache()
   const repos = useAppStore((s) => s.repos)
   const worktreesByRepo = useAppStore((s) => s.worktreesByRepo)
   const tabsByWorktree = useAppStore((s) => s.tabsByWorktree)
+  const unifiedTabsByWorktree = useAppStore((s) => s.unifiedTabsByWorktree)
   const agentStatusByPaneKey = useAppStore((s) => s.agentStatusByPaneKey)
   const retainedAgentsByPaneKey = useAppStore((s) => s.retainedAgentsByPaneKey)
   const migrationUnsupportedByPtyId = useAppStore((s) => s.migrationUnsupportedByPtyId)
@@ -41,6 +45,7 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
   // these two instead of worktreesByRepo.
   const folderWorkspaces = useAppStore((s) => s.folderWorkspaces)
   const projectGroups = useAppStore((s) => s.projectGroups)
+  const sshTargetLabels = useAppStore((s) => s.sshTargetLabels)
   const sshConnectionStates = useAppStore((s) => s.sshConnectionStates)
   const sshStateByEnvironment = useAppStore((s) => s.sshStateByEnvironment)
   const runtimeStatusByEnvironmentId = useAppStore((s) => s.runtimeStatusByEnvironmentId)
@@ -51,6 +56,9 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
   const runtimeEnvironmentCatalogHydrated = useAppStore((s) => s.runtimeEnvironmentCatalogHydrated)
   const removedRuntimeEnvironmentIds = useAppStore((s) => s.removedRuntimeEnvironmentIds)
   const paneForegroundAgentByPaneKey = useAppStore((s) => s.paneForegroundAgentByPaneKey)
+  const detectedAgentIds = useAppStore((s) => s.detectedAgentIds)
+  const remoteDetectedAgentIds = useAppStore((s) => s.remoteDetectedAgentIds)
+  const runtimeDetectedAgentIds = useAppStore((s) => s.runtimeDetectedAgentIds)
   // Why: freshness can flip a bucket without any backing map changing; the epoch
   // ticks on the freshness boundary so the memo re-derives stale-decayed cards.
   const agentStatusEpoch = useAppStore((s) => s.agentStatusEpoch)
@@ -64,6 +72,7 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
           repos,
           worktreesByRepo,
           tabsByWorktree,
+          unifiedTabsByWorktree,
           agentStatusByPaneKey,
           retainedAgentsByPaneKey,
           migrationUnsupportedByPtyId,
@@ -79,6 +88,7 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
           detectedWorktreesByRepo,
           folderWorkspaces,
           projectGroups,
+          sshTargetLabels,
           sshConnectionStates,
           sshStateByEnvironment,
           runtimeStatusByEnvironmentId,
@@ -87,18 +97,25 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
           runtimeEnvironmentCatalogHydrated,
           removedRuntimeEnvironmentIds,
           paneForegroundAgentByPaneKey,
+          detectedAgentIds,
+          remoteDetectedAgentIds,
+          runtimeDetectedAgentIds,
           // Why: read non-reactively — resolveWindowsShiftEnterEncoding takes
           // launch identity but never routes on it, so subscribing would only
           // rebuild the board. Matches the bridge's republish gate.
           agentLaunchConfigByPaneKey: useAppStore.getState().agentLaunchConfigByPaneKey
         },
-        Date.now()
+        Date.now(),
+        // Why: unchanged worktrees reuse their row pipeline; card assembly still runs
+        // fresh against the review/host/status slices this memo subscribes to.
+        { rowsCache: rowsCacheRef.current, rowsGeneration: agentStatusEpoch }
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       repos,
       worktreesByRepo,
       tabsByWorktree,
+      unifiedTabsByWorktree,
       agentStatusByPaneKey,
       retainedAgentsByPaneKey,
       migrationUnsupportedByPtyId,
@@ -114,6 +131,7 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
       detectedWorktreesByRepo,
       folderWorkspaces,
       projectGroups,
+      sshTargetLabels,
       sshConnectionStates,
       sshStateByEnvironment,
       runtimeStatusByEnvironmentId,
@@ -122,6 +140,9 @@ export function useLiveDashboardSnapshot(): DashboardSnapshot {
       runtimeEnvironmentCatalogHydrated,
       removedRuntimeEnvironmentIds,
       paneForegroundAgentByPaneKey,
+      detectedAgentIds,
+      remoteDetectedAgentIds,
+      runtimeDetectedAgentIds,
       agentStatusEpoch
     ]
   )

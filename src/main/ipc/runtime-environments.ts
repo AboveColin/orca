@@ -1,6 +1,6 @@
 import { app, ipcMain } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { resolveEnvironment } from '../../shared/runtime-environment-store'
+import { listEnvironments, resolveEnvironment } from '../../shared/runtime-environment-store'
 import type { RemoteRuntimeSubscription } from '../../shared/remote-runtime-client'
 import type { Store } from '../persistence'
 import {
@@ -8,23 +8,29 @@ import {
   registerRuntimeEnvironmentConnectivityHandlers,
   registerRuntimeEnvironmentPassiveHandlers
 } from './runtime-environment-connectivity-handlers'
-import { closeRemoteRuntimeRequestConnection } from './runtime-environment-request-connections'
+import {
+  closeRemoteRuntimeRequestConnection,
+  getRuntimeEnvironmentStatusOwner
+} from './runtime-environment-request-connections'
 import { registerRuntimeEnvironmentRecoveryHandler } from './runtime-environment-recovery-handler'
 import {
   advanceRuntimeEnvironmentTransportGeneration,
   getRuntimeEnvironmentTransportGeneration
 } from './runtime-environment-transport-generation'
 import {
-  clearSharedControlSupport,
   resetSharedControlSupport,
   subscribeRuntimeEnvironment
 } from './runtime-environment-transport-routing'
 import { RUNTIME_ENVIRONMENT_HANDLER_CHANNELS } from './runtime-environment-handler-channels'
+import { retirePairedRuntimeBrowserClientHostEnvironment } from '../browser/paired-runtime-browser-client-host-runtime'
+import { registerRuntimeEnvironmentBrowserClientHostHandler } from './runtime-environment-browser-client-host-handler'
+import { advanceRuntimeEnvironmentCapabilityIncarnation } from './runtime-environment-capability-evidence'
 
 type RetainedRemoteRuntimeSubscription = RemoteRuntimeSubscription & {
   environmentId: string
   ownerWebContentsId: number
   removeDestroyedListener: () => void
+  notifyClosed: () => void
 }
 const remoteRuntimeSubscriptions = new Map<string, RetainedRemoteRuntimeSubscription>()
 const getUserDataPath = (): string => app.getPath('userData')
@@ -36,15 +42,40 @@ function closeSubscriptionsForEnvironment(environmentId: string): void {
       continue
     }
     remoteRuntimeSubscriptions.delete(subscriptionId)
-    subscription.close()
+    // Why: one failing teardown must not abandon this environment's other
+    // sockets -- that strands exactly the dead handles this sweep exists to
+    // retire. Guard the two steps independently so neither can skip the other,
+    // and so the isolation stays structural rather than resting on a claim that
+    // nothing inside notifyClosed will ever throw.
+    try {
+      subscription.close()
+    } catch (error) {
+      console.warn('[runtime-environments] subscription close failed during retirement:', error)
+    }
+    try {
+      // Why: a shared-control logical close never calls back, so notify directly.
+      subscription.notifyClosed()
+    } catch (error) {
+      console.warn('[runtime-environments] subscription close notice failed:', error)
+    }
   }
 }
-export function invalidateRuntimeEnvironmentTransport(environmentId: string): void {
+/** Returns once the environment's client-hosted browser pages have been released. */
+export function invalidateRuntimeEnvironmentTransport(environmentId: string): Promise<void> {
   // Why: a same-id re-pair must retire every transport that still authenticates as the old peer.
+  advanceRuntimeEnvironmentCapabilityIncarnation(environmentId)
   advanceRuntimeEnvironmentTransportGeneration(environmentId)
   closeRemoteRuntimeRequestConnection(environmentId)
-  clearSharedControlSupport(environmentId)
   closeSubscriptionsForEnvironment(environmentId)
+  return retirePairedRuntimeBrowserClientHostEnvironment(
+    environmentId,
+    new Error('Runtime environment transport was invalidated')
+  ).then(
+    () => undefined,
+    (error) => {
+      console.warn('[runtime-environments] browser client host retirement failed:', error)
+    }
+  )
 }
 
 export function registerRuntimeEnvironmentHandlers(store: Store): void {
@@ -61,8 +92,17 @@ export function registerRuntimeEnvironmentHandlers(store: Store): void {
     getUserDataPath,
     invalidateTransport: invalidateRuntimeEnvironmentTransport
   })
+  registerRuntimeEnvironmentBrowserClientHostHandler({
+    getUserDataPath,
+    getSettings: () => store.getSettings()
+  })
   registerRuntimeEnvironmentRecoveryHandler()
   registerRuntimeEnvironmentPassiveHandlers(getUserDataPath)
+  for (const environment of listEnvironments(getUserDataPath())) {
+    if (!isRuntimeEnvironmentManuallyDisconnected(environment.id)) {
+      getRuntimeEnvironmentStatusOwner(getUserDataPath(), environment.id).activate()
+    }
+  }
   ipcMain.handle(
     'runtimeEnvironments:subscribe',
     async (
@@ -120,6 +160,21 @@ export function registerRuntimeEnvironmentHandlers(store: Store): void {
         removeDestroyedListener()
         subscription?.close()
       }
+      // Why: the renderer treats close as terminal and drops its handle, so send it once.
+      // Latch before sending so a re-entrant call cannot duplicate it, and never
+      // throw: a dying renderer must not abort its siblings' retirement.
+      let closeNotified = false
+      const notifyClosed = (): void => {
+        if (closeNotified || sender.isDestroyed()) {
+          return
+        }
+        closeNotified = true
+        try {
+          sender.send('runtimeEnvironments:subscriptionEvent', { subscriptionId, type: 'close' })
+        } catch {
+          // The renderer is gone; there is no one left to tell.
+        }
+      }
       sender.once('destroyed', closeSubscription)
       destroyedListenerAttached = true
       try {
@@ -131,6 +186,12 @@ export function registerRuntimeEnvironmentHandlers(store: Store): void {
           args.timeoutMs,
           {
             onEvent: (payload) => {
+              if (payload.type === 'close') {
+                // Why: retirement advances the generation before closing, so gating
+                // close on it stranded the renderer with a dead subscription.
+                notifyClosed()
+                return
+              }
               if (transportIsCurrent() && !sender.isDestroyed()) {
                 sender.send('runtimeEnvironments:subscriptionEvent', {
                   subscriptionId,
@@ -143,7 +204,8 @@ export function registerRuntimeEnvironmentHandlers(store: Store): void {
               retained?.removeDestroyedListener()
               remoteRuntimeSubscriptions.delete(subscriptionId)
             }
-          }
+          },
+          transportIsCurrent
         )
       } catch (error) {
         removeDestroyedListener()
@@ -172,6 +234,7 @@ export function registerRuntimeEnvironmentHandlers(store: Store): void {
         environmentId: environment.id,
         ownerWebContentsId,
         removeDestroyedListener,
+        notifyClosed,
         sendBinary: (bytes) => subscription?.sendBinary(bytes) ?? false,
         close: () => {
           removeDestroyedListener()

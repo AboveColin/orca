@@ -28,26 +28,50 @@ export function convergableSkillNames(
   knownSnapshots: Readonly<Record<string, SkillKnownSnapshot[]>>
 ): ReadonlySet<string> {
   const convergable = new Set(globalSkillLocks.keys())
+  if (convergable.size === 0) {
+    return convergable
+  }
+  const observableByName = new Map<string, SkillFreshnessInstallation[]>()
+  for (const entry of installations) {
+    const name = entry.name
+    if (
+      !globalSkillLocks.has(name) ||
+      !SUPPORTED_GLOBAL_SKILL_TOPOLOGIES.has(entry.topology) ||
+      !entry.observedPackageDigest
+    ) {
+      continue
+    }
+    const entries = observableByName.get(name)
+    if (entries) {
+      entries.push(entry)
+    } else {
+      observableByName.set(name, [entry])
+    }
+  }
   for (const [name, lockHash] of globalSkillLocks) {
     // Why: judged only over the placements the command writes, like eligibility
     // itself. A plugin-cache or repo copy is never the command's to converge, so
     // it must neither gate the name nor rescue it — an unidentifiable cache copy
     // (or one parked at the lock's own revision) would otherwise defeat the gate
     // and re-arm the unwinnable update.
-    const digests = installations
-      .filter(
-        (entry) =>
-          entry.name === name &&
-          SUPPORTED_GLOBAL_SKILL_TOPOLOGIES.has(entry.topology) &&
-          entry.observedPackageDigest
-      )
-      .map((entry) => entry.observedPackageDigest)
-    if (digests.length === 0) {
+    const observable = observableByName.get(name) ?? []
+    if (observable.length === 0) {
       continue
     }
-    const revisions = knownSnapshots[name] ?? []
-    const diskTreeShas = digests
-      .map((digest) => revisions.find((revision) => revision.packageDigest === digest)?.gitTreeSha)
+    // `Object.hasOwn`: names come from an on-disk lock file, so a skill called
+    // `constructor` would otherwise read a function off the prototype and throw.
+    const revisions = (Object.hasOwn(knownSnapshots, name) && knownSnapshots[name]) || []
+    // Why: the revision each placement resolved to during observation, not a fresh
+    // lookup by whole-folder digest. Identity tolerates files the manifest never
+    // listed, so a folder holding an agent CLI's sidecar digests to nothing any
+    // revision knows — re-deriving here would call every such placement
+    // unidentifiable and quietly retire the gate for the users who most need it.
+    const diskTreeShas = observable
+      .map(
+        (entry) =>
+          revisions.find((revision) => revision.releaseRevision === entry.installedReleaseRevision)
+            ?.gitTreeSha
+      )
       .filter((sha): sha is string => Boolean(sha))
     // Why: only claim the lock is stale when BOTH sides are positively identified —
     // the lock names a revision we know, and every placement resolves to a different
@@ -55,11 +79,11 @@ export function convergableSkillNames(
     // revision older than the registry) is not evidence of anything, and gating on it
     // would withhold updates that would have worked.
     const lockNamesAKnownRevision = revisions.some((entry) => entry.gitTreeSha === lockHash)
-    // `diskTreeShas` drops digests that match no known revision, so requiring every
-    // observed digest to resolve is what keeps `every` honest: without it, one stale
-    // copy beside one unidentifiable copy would gate the name off the resolved half
-    // alone, contradicting the unknown-stays-eligible rule above.
-    const everyPlacementResolved = diskTreeShas.length === digests.length
+    // `diskTreeShas` drops placements that resolved to no known revision, so requiring
+    // every observable one to resolve is what keeps `every` honest: without it, one
+    // stale copy beside one unidentifiable copy would gate the name off the resolved
+    // half alone, contradicting the unknown-stays-eligible rule above.
+    const everyPlacementResolved = diskTreeShas.length === observable.length
     if (
       lockNamesAKnownRevision &&
       everyPlacementResolved &&

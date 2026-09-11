@@ -11,7 +11,16 @@ import {
   encryptBytes as encryptSharedBytes
 } from '../../../shared/e2ee-crypto'
 import type { RuntimeRpcResponse } from '../../../shared/runtime-rpc-envelope'
-import { SESSION_TAB_CLOSE_INTENT_RUNTIME_CAPABILITY } from '../../../shared/protocol-version'
+import {
+  AGENT_SESSION_BACKGROUND_TASK_ROW_STOP_CAPABILITY,
+  AGENT_SESSION_TURN_ITEM_CAPABILITY,
+  AGENT_SESSION_BOUNDARY_RUNTIME_CAPABILITY,
+  SESSION_TAB_CLOSE_INTENT_RUNTIME_CAPABILITY,
+  SESSION_TABS_RETIREMENT_PROOF_DELTA_RUNTIME_CAPABILITY,
+  WORKTREE_GITHUB_PR_SUPPRESSION_RUNTIME_CAPABILITY,
+  WORKTREE_VISIBILITY_DEFAULTS_RUNTIME_CAPABILITY,
+  WORKTREE_VISIBILITY_SOURCE_DEFAULTS_RUNTIME_CAPABILITY
+} from '../../../shared/protocol-version'
 
 const fakeSockets: FakeWebSocket[] = []
 
@@ -78,7 +87,16 @@ describe('WebRuntimeClient', () => {
     expect(JSON.parse(auth!)).toEqual({
       type: 'e2ee_auth',
       deviceToken: 'token',
-      clientCapabilities: [SESSION_TAB_CLOSE_INTENT_RUNTIME_CAPABILITY]
+      clientCapabilities: [
+        AGENT_SESSION_BACKGROUND_TASK_ROW_STOP_CAPABILITY,
+        AGENT_SESSION_TURN_ITEM_CAPABILITY,
+        SESSION_TAB_CLOSE_INTENT_RUNTIME_CAPABILITY,
+        SESSION_TABS_RETIREMENT_PROOF_DELTA_RUNTIME_CAPABILITY,
+        AGENT_SESSION_BOUNDARY_RUNTIME_CAPABILITY,
+        WORKTREE_GITHUB_PR_SUPPRESSION_RUNTIME_CAPABILITY,
+        WORKTREE_VISIBILITY_DEFAULTS_RUNTIME_CAPABILITY,
+        WORKTREE_VISIBILITY_SOURCE_DEFAULTS_RUNTIME_CAPABILITY
+      ]
     })
 
     client.close()
@@ -210,6 +228,8 @@ describe('WebRuntimeClient', () => {
     }
     timerWindow.setTimeout = setTimeout
     timerWindow.clearTimeout = clearTimeout
+    // Pin the one-sided reconnect jitter to zero so the redial lands on its exact backoff step.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
     const client = new WebRuntimeClient({
       v: 2,
       endpoint: 'ws://127.0.0.1:6768',
@@ -235,6 +255,7 @@ describe('WebRuntimeClient', () => {
       expect(replacementSocket.send).toHaveBeenCalledTimes(1)
     } finally {
       client.close()
+      random.mockRestore()
       vi.useRealTimers()
     }
   })
@@ -643,7 +664,8 @@ describe('WebRuntimeClient', () => {
     vi.stubGlobal('WebSocket', WebSocket)
     const serverKeys = generateKeyPair()
     const frame = new Uint8Array([9, 8, 7])
-    const wss = new WebSocketServer({ port: 0 })
+    // host must match the 127.0.0.1 clients dial: a wildcard bind lets a foreign loopback listener claim the port and answer here.
+    const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 })
     const sockets = new Set<WebSocket>()
     wss.on('connection', (socket) => {
       sockets.add(socket)
