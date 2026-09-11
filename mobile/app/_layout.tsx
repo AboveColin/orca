@@ -8,8 +8,9 @@ import * as Linking from 'expo-linking'
 import { colors } from '../src/theme/mobile-theme'
 import { OrcaLogo } from '../src/components/OrcaLogo'
 import { RpcClientProvider } from '../src/transport/client-context'
-import { getNotificationNavigationPath } from '../src/notifications/notification-routing'
-import { loadHosts } from '../src/transport/host-store'
+import { getNotificationNavigationTarget } from '../src/notifications/notification-routing'
+import { useOpenNotificationRoute } from '../src/notifications/use-open-notification-route'
+import { loadHostCatalog } from '../src/transport/host-store'
 import { extractPairingCodeFromUrl } from '../src/transport/pairing'
 import { recoverMobileRelayPairing } from '../src/transport/mobile-relay-pairing-recovery'
 import { useAppUpdateCheck } from '../src/updates/use-app-update-check'
@@ -36,6 +37,7 @@ Notifications.setNotificationHandler({
 
 export default function RootLayout() {
   const router = useRouter()
+  const openNotificationRoute = useOpenNotificationRoute()
   const handledNotificationIdsRef = useRef<Set<string>>(new Set())
   const { prompt: updatePrompt, dismiss: dismissUpdatePrompt } = useAppUpdateCheck()
 
@@ -71,6 +73,7 @@ export default function RootLayout() {
     return () => sub.remove()
   }, [router])
 
+  // ─── Notification tap routing ───
   // Why: iOS delivers local notification taps through expo-notifications,
   // not Linking. Route both cold-start and warm-start responses to the host
   // and worktree that scheduled the notification.
@@ -94,10 +97,13 @@ export default function RootLayout() {
       }
     }
 
-    async function getNavigationPath(data: unknown): Promise<string | null> {
-      const hosts = await loadHosts().catch(() => null)
-      return getNotificationNavigationPath(data, {
-        knownHostIds: hosts ? new Set(hosts.map((host) => host.id)) : undefined
+    async function getNavigationTarget(data: unknown) {
+      const hosts = await loadHostCatalog().catch(() => null)
+      return getNotificationNavigationTarget(data, {
+        knownHostIds: hosts ? new Set(hosts.map((host) => host.id)) : undefined,
+        credentialStatusByHostId: hosts
+          ? new Map(hosts.map((host) => [host.id, host.credentialStatus]))
+          : undefined
       })
     }
 
@@ -121,13 +127,13 @@ export default function RootLayout() {
         }
       }
 
-      const path = await getNavigationPath(response.notification.request.content.data)
+      const target = await getNavigationTarget(response.notification.request.content.data)
       clearLastNotificationResponse()
       if (disposed) {
         return
       }
-      if (path) {
-        router.push(path)
+      if (target) {
+        openNotificationRoute(target)
       }
     }
 
@@ -143,7 +149,8 @@ export default function RootLayout() {
       disposed = true
       sub.remove()
     }
-  }, [router])
+  }, [openNotificationRoute])
+  // ─── End notification tap routing ───
 
   // Why: hide the native splash only once the navigation Stack has been laid
   // out — this is the earliest moment the user will see actual app content.

@@ -219,14 +219,6 @@ async function getGhLoginOutcome(): Promise<GhLoginOutcome> {
   return probe
 }
 
-/**
- * Resolve the `gh` CLI's GitHub login without ever blocking the caller for
- * longer than the probe wall. Never rejects; unknown resolves to ''.
- */
-export async function getGhLoginAsync(): Promise<string> {
-  return (await getGhLoginOutcome()).login
-}
-
 async function readGitStdout(repoPath: string, args: string[]): Promise<string> {
   try {
     const { stdout } = await gitExecFileAsync(args, {
@@ -267,7 +259,15 @@ async function getConfiguredBranchRemote(repoPath: string, branch: string | null
  * the GitHub account name as its branch prefix.
  */
 async function localRepoHasEffectiveGitHubRemote(repoPath: string): Promise<boolean> {
-  const remotes = (await readGitStdout(repoPath, ['remote'])).split('\n').filter(Boolean)
+  const remoteList = await gitExecFileAsync(['remote'], {
+    cwd: repoPath,
+    timeout: LOCAL_GIT_READ_TIMEOUT_MS
+  }).catch(() => null)
+  const remotes = (remoteList?.stdout.trim() ?? '').split('\n').filter(Boolean)
+  // Only a successful empty list proves there is no hosted remote to inspect.
+  if (remoteList && remotes.length === 0) {
+    return false
+  }
   const defaultBaseRef = await resolveDefaultBaseRefViaExec((argv) =>
     gitExecFileAsync(argv, { cwd: repoPath, timeout: LOCAL_GIT_READ_TIMEOUT_MS })
   )

@@ -4,9 +4,12 @@ import type { MobileSocketWiring } from '../rpc/mobile-socket-wiring'
 import { RelayControlOrigin } from './relay-control-origin'
 import type { RelayControlClient } from './relay-control-client'
 import type { RelayDrainMessage } from './relay-control-protocol'
+import type { RelayHostCloseReason } from '../../../shared/relay-host-close-reason'
 import { RelayDrainRetrySchedule } from './relay-drain-retry-schedule'
 import { RelayHttpError, requestRelayAssignment, type RelayAssignment } from './relay-http-client'
+import { relayRenewalDelayMs } from './relay-renewal-jitter'
 import type { RelayBrokerStatus, RelayIdentity } from './relay-session-broker-contract'
+import type { RelayRegion } from './relay-region-preference'
 
 type RelayOriginPoolOptions = {
   directorUrl: string
@@ -17,6 +20,7 @@ type RelayOriginPoolOptions = {
   mobileSocketWiring: MobileSocketWiring
   isCurrent: () => boolean
   onStatus: (status: RelayBrokerStatus) => void
+  resolvePreferredRegion?: () => Promise<RelayRegion | undefined>
   fetch?: typeof globalThis.fetch
   createControlSocket?: (url: string, relayJwt: string) => WebSocket
   createDataSocket?: (url: string) => WebSocket
@@ -55,6 +59,10 @@ export class RelayOriginPool {
     return this.basisOrigins.get(basisConnId)?.availableControl ?? null
   }
 
+  hasLiveControl(): boolean {
+    return this.activeOrigin?.hasLiveControl() ?? false
+  }
+
   async openInitial(assignment: RelayAssignment, relayJwt: string): Promise<void> {
     this.assignment = assignment
     this.relayJwt = relayJwt
@@ -73,7 +81,7 @@ export class RelayOriginPool {
     }
   }
 
-  closeNow(): void {
+  closeNow(hostCloseReason?: RelayHostCloseReason): void {
     if (this.closed) {
       return
     }
@@ -88,7 +96,7 @@ export class RelayOriginPool {
     }
     this.drainTimers.clear()
     for (const origin of this.origins) {
-      origin.closeNow()
+      origin.closeNow(hostCloseReason)
     }
     this.origins.clear()
     this.drainingOrigins.clear()
@@ -136,7 +144,6 @@ export class RelayOriginPool {
     if (!this.isCurrent() || origin !== this.activeOrigin) {
       return
     }
-    origin.markDraining()
     this.drainingOrigins.add(origin)
     this.options.onStatus('draining')
     if (!this.rotationPromise && !this.drainRetry.pending) {
@@ -154,11 +161,18 @@ export class RelayOriginPool {
       if (!this.relayJwt) {
         throw new Error('relay_authorization_unavailable')
       }
+      const preferredRegion = await this.options.resolvePreferredRegion?.().catch(() => undefined)
+      this.assertCurrent()
       // Why: only the configured director can choose a migration target.
       const assignment = await requestRelayAssignment({
         directorUrl: this.options.directorUrl,
         relayToken: this.relayJwt,
         relayHostId: this.options.relayHostId,
+        // Recovery always follows an established assignment; the director
+        // verifies this and admits through its reconnect fast lane.
+        reconnect: true,
+        preferredRegion,
+        isCurrent: () => this.isCurrent(),
         fetch: this.options.fetch
       })
       this.assertCurrent()
@@ -186,6 +200,12 @@ export class RelayOriginPool {
       this.scheduleControlRotation()
     } catch (error) {
       if (this.isCurrent() && origin === this.activeOrigin) {
+        // Why: this retry loop ran silently during the 2026-08 incident while
+        // Director 503 throttling stretched recovery to minutes.
+        console.warn(
+          '[relay] control recovery attempt failed:',
+          error instanceof Error ? error.message : String(error)
+        )
         const retryAfterMs = error instanceof RelayHttpError ? (error.retryAfterMs ?? 0) : 0
         this.drainRetry.schedule(retryAfterMs, () => this.handleDrain(origin, message))
       }
@@ -225,8 +245,7 @@ export class RelayOriginPool {
     }
     const now = (this.options.now ?? Date.now)()
     const random = this.options.random ?? Math.random
-    const earlyMs = 60_000 + Math.floor(random() * 60_001)
-    const delay = Math.max(0, origin.controlLeaseExpiresAt - earlyMs - now)
+    const delay = relayRenewalDelayMs(origin.controlLeaseExpiresAt, now, random)
     this.rotationTimer = setTimeout(() => void this.rebindActiveControl(origin), delay)
   }
 

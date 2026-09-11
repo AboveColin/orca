@@ -106,6 +106,8 @@ describe('remote runtime terminal data subscriptions', () => {
           ackOutput?: 1
           ackOutputSourceRanges?: 1
           desktopViewportClaims?: 1
+          outputPause?: 1
+          writeUnavailable?: 1
         }
       }>(subscribeFrame.payload)
     expect(subscribePayload?.streamId).toEqual(expect.any(Number))
@@ -113,7 +115,8 @@ describe('remote runtime terminal data subscriptions', () => {
       ackOutput: 1,
       ackOutputSourceRanges: 1,
       desktopViewportClaims: 1,
-      outputPause: 1
+      outputPause: 1,
+      writeUnavailable: 1
     })
 
     callbacks?.onBinary?.(
@@ -569,7 +572,10 @@ describe('remote runtime terminal multiplex ACK gate', () => {
 
     injectSnapshot({ kind: 'scrollback', cols: 120, rows: 40, truncated: false }, 'initial state')
     expect(onSnapshot).toHaveBeenCalledWith('initial state', {
-      pendingEscapeTailAnsi: undefined
+      pendingEscapeTailAnsi: undefined,
+      // The host's serialization grid; the restorer replays there, not at the pane's own.
+      cols: 120,
+      rows: 40
     })
     expect(onSubscribed).toHaveBeenCalledTimes(1)
 
@@ -587,7 +593,9 @@ describe('remote runtime terminal multiplex ACK gate', () => {
     // clears screen and scrollback first and must not replay the subscribe
     // lifecycle.
     expect(onSnapshot).toHaveBeenCalledWith(`\x1b[2J\x1b[3J\x1b[H${'recovered state'}`, {
-      pendingEscapeTailAnsi: undefined
+      pendingEscapeTailAnsi: undefined,
+      cols: 120,
+      rows: 40
     })
     expect(onSubscribed).toHaveBeenCalledTimes(1)
 
@@ -604,7 +612,9 @@ describe('remote runtime terminal multiplex ACK gate', () => {
       ''
     )
     expect(onSnapshot).toHaveBeenCalledWith('\x1b[2J\x1b[3J\x1b[H', {
-      pendingEscapeTailAnsi: undefined
+      pendingEscapeTailAnsi: undefined,
+      cols: 120,
+      rows: 40
     })
     expect(onSubscribed).toHaveBeenCalledTimes(1)
 

@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import type * as NodeCrypto from 'node:crypto'
 import { SshRelaySession } from './ssh-relay-session'
+import { runRemoteOrcaCli } from './ssh-remote-orca-cli'
 import { createMockDeps, mockDeploySuccess } from './ssh-relay-session-test-fixtures'
+import { getDefaultWorkspaceSession } from '../../shared/constants'
+import type { SshRemotePtyLease } from '../../shared/ssh-types'
 
 type MockMuxInstance = {
   requestHandlers: Map<string, (params: Record<string, unknown>) => Promise<unknown>>
@@ -126,6 +129,8 @@ const {
   registerSshPtyProvider,
   getSshPtyProvider,
   getPtyIdsForConnection,
+  clearProviderPtyState,
+  deletePtyOwnership,
   setPtyOwnership,
   restorePtyIncarnation
 } = await import('../ipc/pty')
@@ -220,12 +225,8 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
       const reconnect = session.reconnect(mockConn)
       await vi.advanceTimersByTimeAsync(750)
 
-      expect(
-        vi
-          .mocked(mockStore.markSshRemotePtyLease)
-          .mock.calls.filter(([, , state]) => state === 'attached')
-          .map(([, id]) => id)
-      ).toHaveLength(48)
+      expect(setPtyOwnership).toHaveBeenCalledTimes(48)
+      expect(mockStore.markSshRemotePtyLeasesAttachedAsync).not.toHaveBeenCalled()
       expect(peakActive).toBeLessThanOrEqual(8)
 
       await vi.advanceTimersByTimeAsync(20_000)
@@ -235,6 +236,11 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
       expect(attempts.get('pty-0')).toBe(2)
       expect(attempts.get('pty-1')).toBe(2)
       expect(session.getState()).toBe('ready')
+      expect(mockStore.markSshRemotePtyLeasesAttachedAsync).toHaveBeenCalledOnce()
+      expect(mockStore.markSshRemotePtyLeasesAttachedAsync).toHaveBeenCalledWith(
+        'target-1',
+        expect.arrayContaining(ptyIds.slice(2))
+      )
       expect(mockStore.markSshRemotePtyLease).not.toHaveBeenCalledWith(
         'target-1',
         expect.any(String),
@@ -375,11 +381,32 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
 
     const winningCliHandler = muxInstances[2]?.requestHandlers.get('orca.cli')
     expect(winningCliHandler).toBeDefined()
-    await winningCliHandler?.({ argv: ['status'], cwd: '/', env: {} })
+    await winningCliHandler?.({
+      argv: ['artifacts', 'share', 'report.html'],
+      cwd: '/srv/repo',
+      env: {},
+      stdin: '<h1>Remote</h1>',
+      artifactInput: {
+        sourceKey: '/srv/repo/report.html',
+        fileName: 'report.html',
+        contentType: 'text/html'
+      }
+    })
 
     expect(runtime.registerOrchestrationCompatibilitySshAttachment).toHaveBeenCalledWith(
       'target-1',
       winningIncarnation
+    )
+    expect(vi.mocked(runRemoteOrcaCli)).toHaveBeenCalledWith(
+      runtime,
+      expect.objectContaining({
+        stdin: '<h1>Remote</h1>',
+        artifactInput: {
+          sourceKey: '/srv/repo/report.html',
+          fileName: 'report.html',
+          contentType: 'text/html'
+        }
+      })
     )
     expect(randomUUID).toHaveBeenCalledTimes(3)
   })
@@ -417,11 +444,221 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
       tabId: 'tab-1',
       leafId: INCARNATION_LEAF_ID,
       ptyId: APP_PTY_ID,
-      incarnationId
+      incarnationId,
+      mayReviveRetiredSurface: false
     })
     expect(vi.mocked(mockStore.persistPtyBinding).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(mockStore.markSshRemotePtyLease).mock.invocationCallOrder[0]!
+      vi.mocked(mockStore.markSshRemotePtyLeasesAttachedAsync).mock.invocationCallOrder[0]!
     )
+  })
+
+  it.each([
+    { relay: 'current', incarnationId: 'inc-1', tombstonePartition: 'local' },
+    { relay: 'current', incarnationId: 'inc-1', tombstonePartition: 'host' },
+    { relay: 'legacy', incarnationId: undefined, tombstonePartition: 'local' },
+    { relay: 'legacy', incarnationId: undefined, tombstonePartition: 'host' }
+  ])(
+    'suppresses a $tombstonePartition-partition retired surface from a $relay relay',
+    async ({ incarnationId, tombstonePartition }) => {
+      const { mockConn, mockStore, mockPortForward, getMainWindow, mockWindow } = createMockDeps()
+      const attachForReconnect = vi.fn().mockResolvedValue({
+        ...(incarnationId ? { incarnationId } : {}),
+        replay: 'retired-output'
+      })
+      const shutdown = vi.fn().mockRejectedValue(new Error('transport lost'))
+      vi.mocked(getSshPtyProvider).mockReturnValue({
+        attachForReconnect,
+        shutdown,
+        dispose: vi.fn()
+      } as unknown as ReturnType<typeof getSshPtyProvider>)
+      const worktreeId = 'repo-1::/worktree'
+      const tabId = 'tab-retired'
+      const leafId = INCARNATION_LEAF_ID
+      const paneKey = `${tabId}:${leafId}`
+      const leases: SshRemotePtyLease[] = [
+        {
+          targetId: 'target-1',
+          ptyId: 'pty-live',
+          state: 'detached',
+          worktreeId,
+          tabId,
+          createdAt: 1,
+          updatedAt: 1,
+          leafId
+        }
+      ]
+      vi.mocked(mockStore.getSshRemotePtyLeases).mockReturnValue(leases)
+      const sessionWithTombstone: ReturnType<typeof getDefaultWorkspaceSession> = {
+        ...getDefaultWorkspaceSession(),
+        terminalLayoutsByTabId: {
+          [tabId]: {
+            root: { type: 'leaf', leafId },
+            activeLeafId: leafId,
+            expandedLeafId: null,
+            ptyIdsByLeafId: { [leafId]: APP_PTY_ID }
+          }
+        },
+        terminalSurfaceTombstonesByPaneKey: {
+          [paneKey]: {
+            worktreeId,
+            parentTabId: tabId,
+            leafId,
+            ptyId: APP_PTY_ID,
+            incarnationId: 'inc-1',
+            retiredAt: 1
+          }
+        }
+      }
+      vi.mocked(mockStore.getWorkspaceSession).mockImplementation((hostId) =>
+        (hostId ? 'host' : 'local') === tombstonePartition
+          ? sessionWithTombstone
+          : getDefaultWorkspaceSession()
+      )
+      const runtime = { registerPty: vi.fn(), onPtySpawned: vi.fn() }
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const session = new SshRelaySession(
+          'target-1',
+          getMainWindow,
+          mockStore,
+          mockPortForward,
+          runtime as never
+        )
+        await session.establish(mockConn)
+      } finally {
+        warn.mockRestore()
+      }
+
+      expect(runtime.registerPty).not.toHaveBeenCalled()
+      expect(mockStore.markSshRemotePtyLease).toHaveBeenCalledWith(
+        'target-1',
+        APP_PTY_ID,
+        'expired'
+      )
+      if (incarnationId) {
+        expect(mockStore.recordSshRemotePtyKillIntent).toHaveBeenCalledWith(
+          'target-1',
+          'pty-live',
+          { requestedAt: expect.any(Number), incarnationId, attempts: 0 }
+        )
+        expect(shutdown).toHaveBeenCalledWith(APP_PTY_ID, {
+          immediate: true,
+          expectedIncarnationId: incarnationId
+        })
+      } else {
+        expect(mockStore.recordSshRemotePtyKillIntent).not.toHaveBeenCalled()
+        expect(shutdown).not.toHaveBeenCalled()
+      }
+      expect(clearProviderPtyState).toHaveBeenCalledWith(APP_PTY_ID)
+      expect(deletePtyOwnership).toHaveBeenCalledWith(APP_PTY_ID)
+      expect(mockStore.markSshRemotePtyLeasesAttachedAsync).not.toHaveBeenCalled()
+      expect(mockWindow.webContents.send).not.toHaveBeenCalledWith('pty:replay', {
+        id: APP_PTY_ID,
+        data: 'retired-output'
+      })
+    }
+  )
+
+  it.each([
+    {
+      case: 'stale PTY id',
+      tombstonePtyId: 'ssh:target-1@@pty-old',
+      tombstoneIncarnationId: 'incarnation-old'
+    },
+    {
+      case: 'stale incarnation of the reused PTY id',
+      tombstonePtyId: APP_PTY_ID,
+      tombstoneIncarnationId: 'incarnation-old'
+    },
+    {
+      case: 'same identity at the pane lease old location',
+      tombstonePtyId: APP_PTY_ID,
+      tombstoneIncarnationId: 'incarnation-live'
+    }
+  ])('reattaches a moved pane despite a $case tombstone', async (tombstone) => {
+    const { mockConn, mockStore, mockPortForward, getMainWindow, mockWindow } = createMockDeps()
+    const worktreeId = 'repo-1::/worktree'
+    const oldTabId = 'tab-old'
+    const movedTabId = 'tab-moved'
+    const incarnationId = 'incarnation-live'
+    const shutdown = vi.fn()
+    vi.mocked(getSshPtyProvider).mockReturnValue({
+      attachForReconnect: vi.fn().mockResolvedValue({ incarnationId, replay: 'live-output' }),
+      shutdown,
+      dispose: vi.fn()
+    } as unknown as ReturnType<typeof getSshPtyProvider>)
+    vi.mocked(mockStore.getSshRemotePtyLeases).mockReturnValue([
+      {
+        targetId: 'target-1',
+        ptyId: 'pty-live',
+        state: 'detached',
+        worktreeId,
+        tabId: oldTabId,
+        leafId: INCARNATION_LEAF_ID,
+        createdAt: 1,
+        updatedAt: 1
+      }
+    ])
+    const movedSession: ReturnType<typeof getDefaultWorkspaceSession> = {
+      ...getDefaultWorkspaceSession(),
+      terminalLayoutsByTabId: {
+        [movedTabId]: {
+          root: { type: 'leaf', leafId: INCARNATION_LEAF_ID },
+          activeLeafId: INCARNATION_LEAF_ID,
+          expandedLeafId: null,
+          ptyIdsByLeafId: { [INCARNATION_LEAF_ID]: APP_PTY_ID }
+        }
+      },
+      terminalPtyIncarnationsByPaneKey: {
+        [`${movedTabId}:${INCARNATION_LEAF_ID}`]: incarnationId
+      },
+      terminalSurfaceTombstonesByPaneKey: {
+        [`${oldTabId}:${INCARNATION_LEAF_ID}`]: {
+          worktreeId,
+          parentTabId: oldTabId,
+          leafId: INCARNATION_LEAF_ID,
+          ptyId: tombstone.tombstonePtyId,
+          incarnationId: tombstone.tombstoneIncarnationId,
+          retiredAt: 1
+        }
+      }
+    }
+    vi.mocked(mockStore.getWorkspaceSession).mockImplementation((hostId) =>
+      hostId ? getDefaultWorkspaceSession() : movedSession
+    )
+    const runtime = { registerPty: vi.fn(), onPtySpawned: vi.fn() }
+    const session = new SshRelaySession(
+      'target-1',
+      getMainWindow,
+      mockStore,
+      mockPortForward,
+      runtime as never
+    )
+
+    await session.establish(mockConn)
+
+    expect(runtime.registerPty).toHaveBeenCalledWith(APP_PTY_ID, worktreeId, 'target-1', {
+      tabId: movedTabId,
+      leafId: INCARNATION_LEAF_ID,
+      incarnationId
+    })
+    expect(mockStore.persistPtyBinding).toHaveBeenCalledWith(
+      expect.objectContaining({ tabId: movedTabId, ptyId: APP_PTY_ID, incarnationId })
+    )
+    expect(mockStore.markSshRemotePtyLease).not.toHaveBeenCalledWith(
+      'target-1',
+      APP_PTY_ID,
+      'expired'
+    )
+    expect(mockStore.recordSshRemotePtyKillIntent).not.toHaveBeenCalled()
+    expect(shutdown).not.toHaveBeenCalled()
+    expect(mockStore.markSshRemotePtyLeasesAttachedAsync).toHaveBeenCalledWith('target-1', [
+      'pty-live'
+    ])
+    expect(mockWindow.webContents.send).toHaveBeenCalledWith('pty:replay', {
+      id: APP_PTY_ID,
+      data: 'live-output'
+    })
   })
 
   it('does not restore a PTY whose matching exit shares the attach reply batch', async () => {
@@ -534,8 +771,8 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
     })
   })
 
-  it('keeps the attached PTY when incarnation backfill persistence fails', async () => {
-    const { mockConn, mockStore, mockPortForward, getMainWindow } = createMockDeps()
+  it('keeps the PTY detached when incarnation backfill persistence fails', async () => {
+    const { mockConn, mockStore, mockPortForward, getMainWindow, mockWindow } = createMockDeps()
     const incarnationId = 'incarnation-reconnect'
     vi.mocked(getSshPtyProvider).mockReturnValue({
       attachForReconnect: vi.fn().mockResolvedValue({ incarnationId }),
@@ -548,7 +785,7 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
       throw new Error('disk full')
     })
     const runtime = { onPtySpawned: vi.fn(), registerPty: vi.fn() }
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const session = new SshRelaySession(
       'target-1',
       getMainWindow,
@@ -559,16 +796,14 @@ describe('SshRelaySession reconnect incarnation ordering', () => {
 
     await expect(session.establish(mockConn)).resolves.toBeUndefined()
 
-    expect(runtime.registerPty).toHaveBeenCalledWith(APP_PTY_ID, 'worktree-1', 'target-1', {
-      tabId: 'tab-1',
-      leafId: INCARNATION_LEAF_ID,
-      incarnationId
-    })
-    expect(mockStore.markSshRemotePtyLease).toHaveBeenCalledWith('target-1', 'pty-live', 'attached')
-    expect(consoleError).toHaveBeenCalledWith(
-      '[ssh-relay-session] Failed to persist reconnect incarnation:',
-      expect.any(Error)
+    expect(runtime.registerPty).not.toHaveBeenCalled()
+    expect(setPtyOwnership).not.toHaveBeenCalled()
+    expect(restorePtyIncarnation).not.toHaveBeenCalled()
+    expect(mockStore.markSshRemotePtyLeasesAttachedAsync).not.toHaveBeenCalled()
+    expect(mockWindow.webContents.send).not.toHaveBeenCalledWith('pty:replay', expect.anything())
+    expect(consoleWarn).toHaveBeenCalledWith(
+      expect.stringContaining('Leaving PTY pty-live detached for target-1')
     )
-    consoleError.mockRestore()
+    consoleWarn.mockRestore()
   })
 })

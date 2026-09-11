@@ -71,7 +71,6 @@ type MuxInternals = {
   disposeHandlers: unknown[]
   lastReceivedAt: number
   unackedTimestamps: Map<number, number>
-  writerSaturated: boolean
 }
 
 function getMuxInternals(instance: SshChannelMultiplexer): MuxInternals {
@@ -354,9 +353,10 @@ describe('SshChannelMultiplexer', () => {
       expect(mux.isDisposed()).toBe(true)
     })
 
-    it('suppresses false death while locally saturated and rebases both clocks on drain', () => {
+    it('survives local saturation while the peer keeps talking, and rebases both clocks on drain', () => {
       mux.dispose()
       let drain = (): void => {}
+      let feed: (chunk: Buffer) => void = () => {}
       const written: Buffer[] = []
       const saturatedTransport: MultiplexerTransport = {
         write: (data) => {
@@ -367,21 +367,29 @@ describe('SshChannelMultiplexer', () => {
         onDrain: (callback) => {
           drain = callback
         },
-        onData: vi.fn(),
+        onData: (callback) => {
+          feed = callback
+        },
         onClose: vi.fn()
       }
       mux = new SshChannelMultiplexer(saturatedTransport)
 
       vi.advanceTimersByTime(5_000)
-      expect(getMuxInternals(mux).writerSaturated).toBe(true)
-      vi.advanceTimersByTime(25_000)
+      // The writer parked after its first frame: that is the saturation this test is about.
+      expect(written).toHaveLength(1)
+      // Why: backpressure on our uplink is not evidence of death. The relay's own keepalive is,
+      // and only that inbound traffic may keep the link alive — suppressing the check on
+      // saturation alone wedged a half-open link forever (see the saturation-wedge suite).
+      for (let tick = 0; tick < 5; tick++) {
+        feed(encodeKeepAliveFrame(0, 0))
+        vi.advanceTimersByTime(5_000)
+      }
       expect(mux.isDisposed()).toBe(false)
       expect(written).toHaveLength(1)
 
       drain()
       const resumedAt = Date.now()
       const internals = getMuxInternals(mux)
-      expect(internals.writerSaturated).toBe(false)
       expect(internals.lastReceivedAt).toBe(resumedAt)
       expect(new Set(internals.unackedTimestamps.values())).toEqual(new Set([resumedAt]))
 
@@ -500,6 +508,51 @@ describe('SshChannelMultiplexer', () => {
       mux.dispose()
 
       await expect(mux.request('pty.spawn')).rejects.toThrow('Multiplexer disposed')
+    })
+
+    it('tags a request after a shutdown dispose with DISPOSED', async () => {
+      mux.dispose()
+
+      const error = (await mux.request('pty.spawn').catch((e: unknown) => e)) as Error & {
+        code?: string
+      }
+      expect(error.code).toBe('DISPOSED')
+    })
+
+    it('reports a request after a lost connection as transient', async () => {
+      transport.closeCallbacks[0]()
+
+      const error = (await mux
+        .request('fs.readDir', { path: '/home/me' })
+        .catch((e: unknown) => e)) as Error & { code?: string }
+      expect(error.message).toBe('SSH connection lost, reconnecting...')
+      expect(error.code).toBe('CONNECTION_LOST')
+    })
+
+    it('reports a settled notify after a lost connection as transient', () => {
+      transport.closeCallbacks[0]()
+
+      const settled = vi.fn()
+      mux.notifyWithSettlement('pty.data', { id: 'pty-1', data: 'x' }, settled)
+
+      expect(settled).toHaveBeenCalledWith({
+        outcome: 'refused',
+        reason: 'transport_disposed',
+        error: expect.objectContaining({
+          message: 'SSH connection lost, reconnecting...',
+          code: 'CONNECTION_LOST'
+        })
+      })
+    })
+
+    it('fires a dispose handler registered after dispose with the recorded reason', () => {
+      mux.dispose('connection_lost')
+
+      const disposeHandler = vi.fn()
+      mux.onDispose(disposeHandler)
+
+      expect(disposeHandler).toHaveBeenCalledWith('connection_lost')
+      expect(disposeHandler).toHaveBeenCalledTimes(1)
     })
 
     it('ignores notify after dispose', () => {

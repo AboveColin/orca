@@ -1,5 +1,6 @@
 import type { MessageRow } from './types'
 import { ORCHESTRATION_LEGACY_RUN_ID } from '../../../shared/orchestration-rpc-contract'
+import type { OrchestrationCliCommand } from './cli-command'
 
 const BANNER_WIDTH = 60
 const SEPARATOR = '─'.repeat(BANNER_WIDTH)
@@ -106,4 +107,16 @@ export function formatMessagesForInjection(messages: MessageRow[]): string {
 
   const banners = messages.map(formatMessageBanner).join('\n\n')
   return `\n--- Orchestration Messages (${messages.length}) ---\n${banners}\n---\n`
+}
+
+export function formatMessagePointer(
+  count: number,
+  mailboxHandle?: string,
+  cliCommand: OrchestrationCliCommand = 'orca'
+): string {
+  const noun = count === 1 ? 'message' : 'messages'
+  const runFlag = mailboxHandle?.startsWith('run:')
+    ? ` --run ${mailboxHandle.slice('run:'.length)}`
+    : ''
+  return `\nYou have ${count} orchestration ${noun}. Run \`${cliCommand} orchestration check${runFlag}\`.\n`
 }

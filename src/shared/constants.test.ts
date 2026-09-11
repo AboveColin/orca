@@ -69,6 +69,10 @@ describe('getDefaultSettings', () => {
     expect(getDefaultSettings('/tmp').showMenuBarIcon).toBe(true)
   })
 
+  it('shows terminal link actions by default', () => {
+    expect(getDefaultSettings('/tmp').terminalLinkActionPopoverEnabled).toBe(true)
+  })
+
   it('confirms before closing pinned tabs by default', () => {
     expect(getDefaultSettings('/tmp').confirmClosePinnedTab).toBe(true)
   })
@@ -108,8 +112,8 @@ describe('getDefaultSettings', () => {
   })
 
   it('keeps the agent dashboard popout disabled by default', () => {
-    expect(getDefaultSettings('/tmp').experimentalAgentDashboardPopout).toBe(false)
-    expect(getDefaultSettings('/tmp').experimentalAgentDashboardShowIdle).toBe(false)
+    expect(getDefaultSettings('/tmp').experimentalAgentDashboardPopout).toBeUndefined()
+    expect(getDefaultSettings('/tmp').experimentalAgentDashboardShowIdle).toBeUndefined()
   })
 
   it('routes fresh Codex profiles through the real-home rollout by default', () => {})
@@ -176,5 +180,10 @@ describe('MiniMax defaults', () => {
     // MiniMax usage endpoint exposes by default.
     expect(settings.minimaxGroupId).toBe('')
     expect(settings.minimaxUsageModels).toBe('general')
+  })
+
+  it('defaults the MiniMax endpoint to overseas', () => {
+    const settings = getDefaultSettings('/tmp')
+    expect(settings.minimaxEndpoint).toBe('overseas')
   })
 })

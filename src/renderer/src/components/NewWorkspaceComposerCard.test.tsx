@@ -31,7 +31,9 @@ vi.mock('@/store', () => ({
         setRuntimeEnvironmentStatus: storeMocks.setRuntimeEnvironmentStatus,
         activeModal: 'none',
         settings: { defaultTuiAgent: null, disabledTuiAgents: [] },
-        updateSettings: vi.fn()
+        updateSettings: vi.fn(),
+        projects: [],
+        repos: []
       }),
     {
       getState: () => ({
@@ -60,6 +62,10 @@ vi.mock('@/components/agent/AgentCombobox', () => ({
 vi.mock('@/components/sidebar/AddRemoteHostDialog', () => ({
   AddRemoteHostDialog: ({ mode }: { mode: 'ssh' | 'server' | null }) =>
     mode ? <div data-testid="add-remote-host-dialog" data-mode={mode} /> : null
+}))
+
+vi.mock('@/components/new-workspace/SetProjectLocationDialog', () => ({
+  SetProjectLocationDialog: () => null
 }))
 
 vi.mock('@/components/sparse/SparseCheckoutPresetSelect', () => ({
@@ -98,7 +104,7 @@ vi.mock('@/components/new-workspace/ProjectCombobox', () => ({
     value: string | null
     onValueChange: (value: string) => void
   }) => (
-    <div data-testid="project-combobox" data-value={value ?? ''}>
+    <div data-testid="project-combobox" data-project-combobox-root="true" data-value={value ?? ''}>
       {options.map((option) => (
         <button key={option.id} type="button" onClick={() => onValueChange(option.id)}>
           {option.displayName}
@@ -153,34 +159,49 @@ const devboxNeedsSetupHostOption: ProjectHostSetupOption = {
   projectId: 'project-group:platform',
   hostId: 'ssh:devbox',
   label: 'Devbox',
-  detail: 'Project not set up on this host',
+  detail: 'Project location not set',
   isAvailable: true,
-  attention: false
+  attention: false,
+  canSetLocation: true
 }
 
-const disconnectedDevboxNeedsSetupHostOption: ProjectHostSetupOption = {
-  kind: 'needs-setup',
-  id: 'needs-setup:ssh:devbox',
-  projectId: 'project-group:platform',
-  hostId: 'ssh:devbox',
-  label: 'Devbox',
-  detail: 'Connect this host to set up projects',
-  isAvailable: false,
-  attention: false,
-  connectAction: { kind: 'ssh', targetId: 'devbox' }
+function makeDisconnectedHostOption(targetId: string, label: string): ProjectHostSetupOption {
+  return {
+    kind: 'needs-setup',
+    id: `needs-setup:ssh:${targetId}`,
+    projectId: 'project-group:platform',
+    hostId: `ssh:${targetId}`,
+    label,
+    detail: 'Connect this host to set up projects',
+    isAvailable: false,
+    attention: false,
+    canSetLocation: false,
+    connectAction: { kind: 'ssh', targetId }
+  }
 }
 
-const disconnectedBastionNeedsSetupHostOption: ProjectHostSetupOption = {
-  kind: 'needs-setup',
-  id: 'needs-setup:ssh:bastion',
-  projectId: 'project-group:platform',
-  hostId: 'ssh:bastion',
-  label: 'Bastion',
-  detail: 'Connect this host to set up projects',
-  isAvailable: false,
-  attention: false,
-  connectAction: { kind: 'ssh', targetId: 'bastion' }
+const disconnectedDevboxNeedsSetupHostOption = makeDisconnectedHostOption('devbox', 'Devbox')
+const disconnectedBastionNeedsSetupHostOption = makeDisconnectedHostOption('bastion', 'Bastion')
+
+const pnpmInstallSetupConfig = {
+  source: 'yaml' as const,
+  command: 'pnpm install',
+  kind: 'setup' as const
 }
+
+const vmRecipeHostOptions: ProjectHostSetupOption[] = [
+  localReadyHostOption,
+  {
+    kind: 'ready',
+    id: 'setup-builder',
+    projectId: 'project-group:platform',
+    hostId: 'ssh:builder',
+    repoId: 'repo-a',
+    label: 'Builder',
+    detail: 'Orca',
+    path: '/workspace/orca'
+  }
+]
 
 function findConnectButton(label: string): HTMLButtonElement | undefined {
   const item = findRunTargetItem(label)
@@ -221,6 +242,8 @@ function renderCard(
         onReuseSelectedBranchChange={() => {}}
         branchNameOverride=""
         onBranchNameOverrideChange={() => {}}
+        parentWorktreeId={null}
+        onParentWorktreeIdChange={() => {}}
         forkPushWarning={null}
         detectedAgentIds={null}
         onOpenAgentSettings={() => {}}
@@ -297,6 +320,17 @@ function findRunTargetItem(label: string): HTMLElement | undefined {
 
 let current: { container: HTMLDivElement; root: Root } | null = null
 
+function unmountCurrent(): void {
+  act(() => current?.root.unmount())
+  current?.container.remove()
+}
+
+function findWaitSwitch(container: HTMLElement): HTMLButtonElement | null {
+  return container.querySelector<HTMLButtonElement>(
+    '[role="switch"][aria-label="Wait for setup to complete before starting agent"]'
+  )
+}
+
 describe('NewWorkspaceComposerCard folder task source mode', () => {
   beforeEach(() => {
     ;(window as unknown as { api: unknown }).api = {
@@ -324,10 +358,29 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
   })
 
   afterEach(() => {
-    act(() => current?.root.unmount())
-    current?.container.remove()
+    unmountCurrent()
     current = null
     vi.clearAllMocks()
+  })
+
+  it('keeps the Advanced focus highlight inside the composer edge', () => {
+    current = renderCard()
+
+    const advancedButton = [...current.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Advanced')
+    )
+
+    expect(advancedButton?.className).toContain('focus-visible:ring-inset')
+  })
+
+  it('removes collapsed Advanced controls from the Tab order', () => {
+    current = renderCard({ advancedOpen: false, branchesEnabled: true })
+
+    const advancedPanel = [...current.container.querySelectorAll('[aria-hidden="true"]')].find(
+      (element) => element.querySelector('textarea[placeholder="Write a note"]') !== null
+    )
+
+    expect(advancedPanel?.hasAttribute('inert')).toBe(true)
   })
 
   it('passes folder child repos into the create-from field without a source trigger', () => {
@@ -343,18 +396,31 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     )
     expect(projectSection?.textContent).not.toContain('Task Source')
     expect(nameSection?.textContent).toContain("Name or 'Create From'")
-    expect(
-      current.container
-        .querySelector('[aria-label="workspace name"]')
-        ?.getAttribute('data-repo-backed-search-count')
-    ).toBe('2')
-    expect(
-      current.container
-        .querySelector('[aria-label="workspace name"]')
-        ?.getAttribute('data-repo-backed-search-names')
-    ).toBe('Repo A,Repo B')
+    const nameInput = current.container.querySelector('[aria-label="workspace name"]')
+    expect(nameInput?.getAttribute('data-repo-backed-search-count')).toBe('2')
+    expect(nameInput?.getAttribute('data-repo-backed-search-names')).toBe('Repo A,Repo B')
     expect(current.container.querySelector('[data-testid="repo-backed-source-trigger"]')).toBeNull()
     expect(current.container.querySelectorAll('[data-testid="project-combobox"]')).toHaveLength(1)
+  })
+
+  it('scopes the workspace-creation-project tour target to the project picker rather than the run target picker', () => {
+    current = renderCard({ projectHostSetupOptions: [localReadyHostOption] })
+
+    const projectTourTarget = current.container.querySelector(
+      '[data-contextual-tour-target="workspace-creation-project"]'
+    )
+    expect(projectTourTarget).toBeTruthy()
+    expect(projectTourTarget?.querySelector('[data-project-combobox-root="true"]')).toBeTruthy()
+    expect(projectTourTarget?.querySelector('[data-run-target-combobox-root="true"]')).toBeNull()
+    expect(projectTourTarget?.textContent).not.toContain('Run on')
+    expect(projectTourTarget?.querySelector('label')).toBeNull()
+    expect(projectTourTarget?.querySelector('[aria-label="Add project"]')).toBeNull()
+    expect(current.container.querySelector('[aria-label="Add project"]')).toBeTruthy()
+
+    const runTargetPicker = current.container.querySelector(
+      'div[data-run-target-combobox-root="true"]'
+    )
+    expect(runTargetPicker).toBeTruthy()
   })
 
   it('keeps the reuse-branch row collapsed until a local branch is reusable', () => {
@@ -366,8 +432,7 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     )
     expect(collapsedReuse).toBeTruthy()
 
-    act(() => current?.root.unmount())
-    current?.container.remove()
+    unmountCurrent()
 
     current = renderCard({ canReuseSelectedBranch: true, reuseSelectedBranch: true })
     const reuseLabel = [...current.container.querySelectorAll('label')].find((label) =>
@@ -401,8 +466,7 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     clickReuseCheckbox()
     expect(offChanges).toEqual([false])
 
-    act(() => current?.root.unmount())
-    current?.container.remove()
+    unmountCurrent()
 
     // Unchecked -> checked (opting into reuse — the action that pins the branch).
     const onChanges: boolean[] = []
@@ -429,17 +493,12 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
       'Wait for setup to complete before starting agent'
     )
 
-    act(() => current?.root.unmount())
-    current?.container.remove()
+    unmountCurrent()
 
     current = renderCard({
       advancedOpen: true,
       setupControlsEnabled: true,
-      setupConfig: {
-        source: 'yaml',
-        command: 'pnpm install',
-        kind: 'setup'
-      }
+      setupConfig: pnpmInstallSetupConfig
     })
     expect(current.container.textContent).toContain(
       'Wait for setup to complete before starting agent'
@@ -452,17 +511,11 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
       advancedOpen: true,
       setupControlsEnabled: true,
       resolvedSetupDecision: 'run',
-      setupConfig: {
-        source: 'yaml',
-        command: 'pnpm install',
-        kind: 'setup'
-      },
+      setupConfig: pnpmInstallSetupConfig,
       onSetupAgentStartupPolicyChange: (next) => changes.push(next)
     })
 
-    const waitSwitch = current.container.querySelector<HTMLButtonElement>(
-      '[role="switch"][aria-label="Wait for setup to complete before starting agent"]'
-    )
+    const waitSwitch = findWaitSwitch(current.container)
     expect(waitSwitch).toBeTruthy()
     expect(waitSwitch?.disabled).toBe(false)
     act(() => waitSwitch?.click())
@@ -475,17 +528,11 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
       advancedOpen: true,
       setupControlsEnabled: true,
       resolvedSetupDecision: 'skip',
-      setupConfig: {
-        source: 'yaml',
-        command: 'pnpm install',
-        kind: 'setup'
-      },
+      setupConfig: pnpmInstallSetupConfig,
       onSetupAgentStartupPolicyChange: (next) => changes.push(next)
     })
 
-    const waitSwitch = current.container.querySelector<HTMLButtonElement>(
-      '[role="switch"][aria-label="Wait for setup to complete before starting agent"]'
-    )
+    const waitSwitch = findWaitSwitch(current.container)
     expect(waitSwitch?.disabled).toBe(true)
     // Nothing to wait for when setup won't run — clicking is inert.
     act(() => waitSwitch?.click())
@@ -550,6 +597,19 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     expect(findInputByLabel(current.container, 'Branch name')).toBeTruthy()
   })
 
+  it('places the parent workspace picker immediately after the branch name field', () => {
+    current = renderCard({
+      advancedOpen: true,
+      branchesEnabled: true
+    })
+
+    const nextField = findInputByLabel(current.container, 'Branch name')?.closest(
+      'div.space-y-1'
+    )?.nextElementSibling
+    expect(nextField?.textContent).toMatch(/Parent worktree(?!.*Note)/)
+    expect(nextField?.nextElementSibling?.textContent).toContain('Note')
+  })
+
   it('does not disable folder workspace creation when only source lookup needs SSH', () => {
     current = renderCard({
       eligibleRepos: [
@@ -581,7 +641,8 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     openRunTargetPicker(current.container)
 
     const devboxItem = findRunTargetItem('Devbox')
-    expect(devboxItem?.textContent).toContain('Project not set up on this host')
+    expect(devboxItem?.textContent).not.toContain('Project location not set')
+    expect(devboxItem?.textContent).toContain('Set project location')
     // Not-connected rows stay highlightable (never `disabled`) so they hover like
     // the other rows; they're quieted visually instead.
     expect(devboxItem?.hasAttribute('data-disabled')).toBe(false)
@@ -753,20 +814,7 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     const hostChanges: string[] = []
     const recipeChanges: (string | null)[] = []
     current = renderCard({
-      projectHostSetupOptions: [
-        {
-          kind: 'ready',
-          id: 'setup-local',
-          label: 'Local Mac',
-          path: '/Users/alice/orca'
-        },
-        {
-          kind: 'ready',
-          id: 'setup-builder',
-          label: 'Builder',
-          path: '/workspace/orca'
-        }
-      ] as never,
+      projectHostSetupOptions: vmRecipeHostOptions,
       selectedProjectHostSetupId: 'setup-local',
       onProjectHostSetupChange: (setupId) => hostChanges.push(setupId),
       ephemeralVmRecipes: [
@@ -807,20 +855,7 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
     const hostChanges: string[] = []
     const recipeChanges: (string | null)[] = []
     current = renderCard({
-      projectHostSetupOptions: [
-        {
-          kind: 'ready',
-          id: 'setup-local',
-          label: 'Local Mac',
-          path: '/Users/alice/orca'
-        },
-        {
-          kind: 'ready',
-          id: 'setup-builder',
-          label: 'Builder',
-          path: '/workspace/orca'
-        }
-      ] as never,
+      projectHostSetupOptions: vmRecipeHostOptions,
       selectedProjectHostSetupId: 'setup-local',
       onProjectHostSetupChange: (setupId) => hostChanges.push(setupId),
       ephemeralVmRecipes: [
@@ -849,5 +884,43 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
 
     expect(hostChanges).toEqual(['setup-builder'])
     expect(recipeChanges).toEqual([null])
+  })
+})
+
+describe('NewWorkspaceComposerCard note sizing', () => {
+  // Sizing is layout-driven (field-sizing) rather than a JS measure pass, and happy-dom
+  // has no layout engine, so these assert the class contract that produces the growth.
+  afterEach(() => {
+    unmountCurrent()
+    current = null
+  })
+
+  function findNoteTextarea(container: HTMLElement): HTMLTextAreaElement {
+    const label = [...container.querySelectorAll('label')].find(
+      (candidate) => candidate.textContent?.trim() === 'Note'
+    )
+    const textarea = label?.parentElement?.querySelector('textarea')
+    expect(textarea).toBeTruthy()
+    return textarea as HTMLTextAreaElement
+  }
+
+  it('sizes from the note value, so a PR prefill written straight to state still shows in full', () => {
+    // #10575: the prefill never fires an input event, so nothing but the value can drive height.
+    current = renderCard({
+      advancedOpen: true,
+      note: `PR #10575 — ${'a note title long enough to wrap over several lines '.repeat(3)}`
+    })
+
+    expect(findNoteTextarea(current.container).className).toContain('[field-sizing:content]')
+  })
+
+  it('keeps a note past the height cap readable instead of clipping it', () => {
+    current = renderCard({ advancedOpen: true, note: 'a'.repeat(4000) })
+
+    const { className } = findNoteTextarea(current.container)
+    expect(className).toContain('max-h-40')
+    expect(className).toContain('overflow-y-auto')
+    expect(className).toContain('scrollbar-sleek')
+    expect(className).not.toContain('overflow-hidden')
   })
 })

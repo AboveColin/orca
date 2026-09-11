@@ -13,10 +13,13 @@ import {
 } from './protocol'
 import { relayLogLine } from './relay-diagnostic-log'
 
-// Why: client maps this exit code to a non-retryable error so it skips reconnect backoff; other non-zero exits are treated as transient.
+// Why: clients treat this exit code as non-retryable; other non-zero exits are transient.
 export const EXIT_CODE_VERSION_MISMATCH = 42
+// Why distinct from 42: a refused credential is a live daemon saying no, which the client must
+// not confuse with a crashed bridge (exit 0/1) or with a version skew (42).
+export const EXIT_CODE_CREDENTIAL_MISMATCH = 43
 
-// Why: read .version next to the resolved script path (realpathSync, not cwd) so arbitrary-cwd or symlink-launched spawns still report a coherent version.
+// Why: read .version beside the resolved script path, not the arbitrary launch cwd.
 export function readLaunchVersion(): string {
   try {
     const entry = process.argv[1]
@@ -62,12 +65,7 @@ export function setupDaemonHandshake(sock: Socket, cb: DaemonHandshakeCallbacks)
       if (handshakeResolved) {
         return
       }
-      const accepted = handleDaemonHandshakeFrame(
-        sock,
-        frame,
-        cb.launchVersion,
-        cb.endpointCredential
-      )
+      const accepted = handleDaemonHandshakeFrame(sock, frame, cb)
       if (accepted) {
         handshakeResolved = true
         const leftover = decoder.drain()
@@ -100,9 +98,9 @@ export function detachHandshakeListener(sock: Socket): void {
 function handleDaemonHandshakeFrame(
   sock: Socket,
   frame: DecodedFrame,
-  launchVersion: string,
-  endpointCredential?: string
+  cb: DaemonHandshakeCallbacks
 ): boolean {
+  const { launchVersion, endpointCredential } = cb
   if (frame.type !== MessageType.Handshake) {
     process.stderr.write(
       `[relay] Protocol violation pre-handshake: type=${frame.type}; closing socket\n`
@@ -141,12 +139,15 @@ function handleDaemonHandshakeFrame(
     sock.end()
     return false
   }
-  if (
-    endpointCredential !== undefined &&
-    ('endpointCredential' in msg ? msg.endpointCredential : undefined) !== endpointCredential
-  ) {
+  const presented = 'endpointCredential' in msg ? msg.endpointCredential : undefined
+  if (endpointCredential !== undefined && presented !== endpointCredential) {
     relayLogLine('[relay] Endpoint credential mismatch; closing socket')
-    sock.destroy()
+    try {
+      sock.write(encodeHandshakeFrame({ type: 'orca-relay-handshake-credential-mismatch' }))
+    } catch {
+      /* best-effort — the close alone still refuses */
+    }
+    sock.end()
     return false
   }
   process.stderr.write(`[relay] Handshake OK from version=${msg.version}\n`)
@@ -161,7 +162,7 @@ export type ConnectHandshakeCallbacks = {
   onAccepted: (leftover: Buffer) => void
 }
 
-// Why: bridge-side version handshake; defense-in-depth so a bad .version can't let a v2 bridge drive a v1 daemon (cf. VS Code remoteExtensionHostAgentServer.ts:340).
+// Why: defense-in-depth prevents a bad .version from pairing incompatible bridge and daemon versions.
 export function runConnectHandshake(
   sock: Socket,
   myVersion: string,
@@ -207,6 +208,16 @@ export function runConnectHandshake(
           () => {
             sock.destroy()
             process.exit(EXIT_CODE_VERSION_MISMATCH)
+          }
+        )
+        return
+      }
+      if (msg.type === 'orca-relay-handshake-credential-mismatch') {
+        process.stderr.write(
+          `[relay-connect] Endpoint credential refused by daemon; exiting ${EXIT_CODE_CREDENTIAL_MISMATCH}\n`,
+          () => {
+            sock.destroy()
+            process.exit(EXIT_CODE_CREDENTIAL_MISMATCH)
           }
         )
         return

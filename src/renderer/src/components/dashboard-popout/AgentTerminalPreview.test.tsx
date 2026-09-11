@@ -3,14 +3,6 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  TERMINAL_PASTE_CHUNK_MAX_BYTES,
-  TERMINAL_PASTE_DIRECT_MAX_BYTES
-} from '@/components/terminal-pane/terminal-paste-limits'
-import {
-  BRACKETED_PASTE_END,
-  BRACKETED_PASTE_START
-} from '@/components/terminal-pane/terminal-bracketed-paste'
 
 const terminalHarness = vi.hoisted(() => ({
   instances: [] as {
@@ -24,6 +16,7 @@ const terminalHarness = vi.hoisted(() => ({
     input: ReturnType<typeof vi.fn>
     scrollToTop: ReturnType<typeof vi.fn>
     scrollToBottom: ReturnType<typeof vi.fn>
+    selectAll: ReturnType<typeof vi.fn>
     modes: { bracketedPasteMode: boolean }
     selectionText: string
     customKeyHandler: ((event: KeyboardEvent) => boolean) | null
@@ -43,10 +36,10 @@ const imeHarness = vi.hoisted(() => ({
     claimKeyEvent: ReturnType<typeof vi.fn>
     dispose: ReturnType<typeof vi.fn>
     sendInput: (data: string) => void
+    getKittyKeyboardFlags: () => number
   }[],
   trackers: [] as { dispose: ReturnType<typeof vi.fn> }[],
-  claimResult: false,
-  inputSourceTrackerRequests: 0
+  claimResult: false
 }))
 
 vi.mock('@xterm/xterm', () => ({
@@ -83,6 +76,7 @@ vi.mock('@xterm/xterm', () => ({
     attachCustomWheelEventHandler = vi.fn()
     scrollToTop = vi.fn()
     scrollToBottom = vi.fn()
+    selectAll = vi.fn()
     getSelection = vi.fn(() => this.selectionText)
     attachCustomKeyEventHandler = vi.fn((handler: (event: KeyboardEvent) => boolean) => {
       this.customKeyHandler = handler
@@ -114,11 +108,17 @@ vi.mock('@/lib/shortcut-platform', () => ({
   getShortcutPlatform: () => platformState.value
 }))
 vi.mock('@/components/terminal-pane/terminal-ime-native-text-forwarder', () => ({
-  installTerminalImeNativeTextForwarder: (args: { sendInput: (data: string) => void }) => {
+  installTerminalImeNativeTextForwarder: (args: {
+    sendInput: (data: string) => void
+    getKittyKeyboardFlags?: () => number
+  }) => {
     const forwarder = {
       claimKeyEvent: vi.fn(() => imeHarness.claimResult),
       dispose: vi.fn(),
-      sendInput: args.sendInput
+      sendInput: args.sendInput,
+      // Why captured: the bridge's whole job is handing the live mirror to the
+      // forwarder, so the test reads what a real commit would read.
+      getKittyKeyboardFlags: args.getKittyKeyboardFlags ?? ((): number => 0)
     }
     imeHarness.forwarders.push(forwarder)
     return forwarder
@@ -129,12 +129,6 @@ vi.mock('@/components/terminal-pane/terminal-ime-composition-tracker', () => ({
     const tracker = { isActive: () => false, dispose: vi.fn() }
     imeHarness.trackers.push(tracker)
     return tracker
-  }
-}))
-vi.mock('@/components/terminal-pane/terminal-ime-input-source', () => ({
-  getMacNativeTextInputSourceTracker: () => {
-    imeHarness.inputSourceTrackerRequests++
-    return { getFeatures: () => ({}) }
   }
 }))
 vi.mock('@/store', () => {
@@ -155,7 +149,6 @@ describe('AgentTerminalPreview', () => {
   const writeClipboardText = vi.fn(async () => {})
   const writeTerminalClipboardText = vi.fn(async () => {})
   let emitData: ((payload: unknown) => void) | null
-  let emitAppMenuPaste: (() => void) | null
 
   beforeEach(() => {
     terminalHarness.instances.length = 0
@@ -165,9 +158,7 @@ describe('AgentTerminalPreview', () => {
     imeHarness.forwarders.length = 0
     imeHarness.trackers.length = 0
     imeHarness.claimResult = false
-    imeHarness.inputSourceTrackerRequests = 0
     emitData = null
-    emitAppMenuPaste = null
     connect.mockResolvedValue({
       snapshot: { data: '', cols: 80, rows: 24, seq: 1 },
       replay: []
@@ -190,10 +181,7 @@ describe('AgentTerminalPreview', () => {
           readClipboardText,
           writeClipboardText,
           writeTerminalClipboardText,
-          onAppMenuPaste: (listener: () => void) => {
-            emitAppMenuPaste = listener
-            return vi.fn()
-          }
+          performNativeSelectionAction: vi.fn()
         }
       }
     })
@@ -235,7 +223,6 @@ describe('AgentTerminalPreview', () => {
     await waitFor(() => expect(terminal.customKeyHandler).not.toBeNull())
     expect(imeHarness.forwarders).toHaveLength(1)
     expect(imeHarness.trackers).toHaveLength(1)
-    expect(imeHarness.inputSourceTrackerRequests).toBe(1)
 
     imeHarness.forwarders[0]!.sendInput('。')
     expect(terminal.input).toHaveBeenCalledOnce()
@@ -246,7 +233,7 @@ describe('AgentTerminalPreview', () => {
     imeHarness.claimResult = true
     terminal.selectionText = 'selected text'
     const handled = terminal.customKeyHandler!(
-      new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', metaKey: true, shiftKey: true })
+      new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true })
     )
     expect(handled).toBe(false)
     expect(writeClipboardText).not.toHaveBeenCalled()
@@ -255,12 +242,11 @@ describe('AgentTerminalPreview', () => {
     // Unclaimed events still reach the chord handling.
     imeHarness.claimResult = false
     const copied = terminal.customKeyHandler!(
-      new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', metaKey: true, shiftKey: true })
+      new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', metaKey: true })
     )
     expect(copied).toBe(false)
     expect(writeTerminalClipboardText).toHaveBeenCalledWith('selected text')
     expect(writeClipboardText).not.toHaveBeenCalled()
-    expect(imeHarness.inputSourceTrackerRequests).toBe(1)
   })
 
   it('does not install the IME native-text forwarder off macOS', async () => {
@@ -269,6 +255,26 @@ describe('AgentTerminalPreview', () => {
     await waitFor(() => expect(terminalHarness.instances[0]!.customKeyHandler).not.toBeNull())
     expect(imeHarness.forwarders).toHaveLength(0)
     expect(imeHarness.trackers).toHaveLength(0)
+  })
+
+  // The bridge omitted this dependency entirely, so every Preview
+  // commit was evaluated at flags 0. Ordering and provenance live in
+  // preview-terminal-snapshot-replay.test.ts; this pins the wiring.
+  it('hands the forwarder the live mirror seeded from the snapshot flags', async () => {
+    platformState.value = 'darwin'
+    connect.mockResolvedValue({
+      snapshot: { data: '', cols: 80, rows: 24, seq: 1, kittyKeyboardFlags: 8 },
+      replay: []
+    })
+    render(<AgentTerminalPreview ptyId="pty-1" />)
+    await waitFor(() => expect(imeHarness.forwarders).toHaveLength(1))
+    await waitFor(() => expect(imeHarness.forwarders[0]!.getKittyKeyboardFlags()).toBe(8))
+
+    // Live output keeps advancing the same mirror the forwarder reads.
+    act(() => {
+      emitData?.({ type: 'data', ptyId: 'pty-1', data: '\x1b[<u', bytes: 4 })
+    })
+    expect(imeHarness.forwarders[0]!.getKittyKeyboardFlags()).toBe(0)
   })
 
   it('disposes the IME bridge on unmount', async () => {
@@ -337,30 +343,45 @@ describe('AgentTerminalPreview', () => {
     expect(writeTerminalClipboardText).not.toHaveBeenCalled()
   })
 
-  it('pastes clipboard text on the app-menu paste signal while the preview owns focus', async () => {
-    const view = render(<AgentTerminalPreview ptyId="pty-1" />)
-    await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
-    const terminal = terminalHarness.instances[0]!
-    expect(emitAppMenuPaste).not.toBeNull()
-
-    const host = view.container.querySelector<HTMLElement>('.origin-bottom-left')!
-    const focusTarget = document.createElement('input')
-    host.appendChild(focusTarget)
-    focusTarget.focus()
-
-    act(() => emitAppMenuPaste!())
-    await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith('clip-text'))
-    expect(input).toHaveBeenCalledWith('pty-1', 'clip-text')
-  })
-
-  it('ignores the app-menu paste signal when focus is outside the preview', async () => {
+  it('leaves bare Ctrl+C available to the terminal without a selection', async () => {
     render(<AgentTerminalPreview ptyId="pty-1" />)
     await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
-    expect(emitAppMenuPaste).not.toBeNull()
+    const terminal = terminalHarness.instances[0]!
+    await waitFor(() => expect(terminal.customKeyHandler).not.toBeNull())
 
-    await act(async () => emitAppMenuPaste!())
-    expect(readClipboardText).not.toHaveBeenCalled()
-    expect(terminalHarness.instances[0]!.paste).not.toHaveBeenCalled()
+    const handled = terminal.customKeyHandler!(
+      new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true })
+    )
+    expect(handled).toBe(true)
+    expect(writeTerminalClipboardText).not.toHaveBeenCalled()
+  })
+
+  it('selects all terminal text on Cmd+A and blocks xterm handling', async () => {
+    platformState.value = 'darwin'
+    render(<AgentTerminalPreview ptyId="pty-1" />)
+    await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
+    const terminal = terminalHarness.instances[0]!
+    await waitFor(() => expect(terminal.customKeyHandler).not.toBeNull())
+
+    const keydown = new KeyboardEvent('keydown', {
+      key: 'a',
+      code: 'KeyA',
+      metaKey: true,
+      cancelable: true
+    })
+    expect(terminal.customKeyHandler!(keydown)).toBe(false)
+    expect(keydown.defaultPrevented).toBe(true)
+
+    const repeat = new KeyboardEvent('keydown', {
+      key: 'a',
+      code: 'KeyA',
+      metaKey: true,
+      repeat: true,
+      cancelable: true
+    })
+    expect(terminal.customKeyHandler!(repeat)).toBe(false)
+    expect(repeat.defaultPrevented).toBe(true)
+    expect(terminal.selectAll).toHaveBeenCalledOnce()
   })
 
   it('sends the word-kill byte on Ctrl+Backspace and blocks xterm handling', async () => {
@@ -532,132 +553,6 @@ describe('AgentTerminalPreview', () => {
     expect(terminal.input).not.toHaveBeenCalled()
   })
 
-  it('leaves plain Ctrl+V to the Edit-menu accelerator but handles the shifted paste chord', async () => {
-    const view = render(<AgentTerminalPreview ptyId="pty-1" />)
-    await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
-    const terminal = terminalHarness.instances[0]!
-    await waitFor(() => expect(terminal.customKeyHandler).not.toBeNull())
-    const host = view.container.querySelector<HTMLElement>('.origin-bottom-left')!
-    const terminalInput = document.createElement('input')
-    host.appendChild(terminalInput)
-    terminalInput.focus()
-
-    const plain = terminal.customKeyHandler!(
-      new KeyboardEvent('keydown', { key: 'v', code: 'KeyV', ctrlKey: true })
-    )
-    expect(plain).toBe(true)
-    expect(readClipboardText).not.toHaveBeenCalled()
-
-    const shiftedEvent = new KeyboardEvent('keydown', {
-      key: 'V',
-      code: 'KeyV',
-      ctrlKey: true,
-      shiftKey: true,
-      cancelable: true
-    })
-    const shifted = terminal.customKeyHandler!(shiftedEvent)
-    const repeated = terminal.customKeyHandler!(
-      new KeyboardEvent('keydown', {
-        key: 'V',
-        code: 'KeyV',
-        ctrlKey: true,
-        shiftKey: true,
-        repeat: true
-      })
-    )
-    expect(shifted).toBe(false)
-    expect(repeated).toBe(false)
-    expect(shiftedEvent.defaultPrevented).toBe(true)
-    await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith('clip-text'))
-    expect(readClipboardText).toHaveBeenCalledTimes(1)
-    expect(
-      terminal.customKeyHandler!(
-        new KeyboardEvent('keyup', { key: 'V', code: 'KeyV', ctrlKey: true, shiftKey: true })
-      )
-    ).toBe(false)
-  })
-
-  it('cancels an async paste when the preview loses focus', async () => {
-    let resolveClipboard!: (text: string) => void
-    readClipboardText.mockReturnValueOnce(
-      new Promise((resolve) => {
-        resolveClipboard = resolve
-      })
-    )
-    const view = render(<AgentTerminalPreview ptyId="pty-1" />)
-    await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
-    const terminal = terminalHarness.instances[0]!
-    const host = view.container.querySelector<HTMLElement>('.origin-bottom-left')!
-    const terminalInput = document.createElement('input')
-    const outsideInput = document.createElement('input')
-    host.appendChild(terminalInput)
-    view.container.appendChild(outsideInput)
-    terminalInput.focus()
-
-    act(() => emitAppMenuPaste!())
-    outsideInput.focus()
-    await act(async () => resolveClipboard('stale text'))
-
-    expect(terminal.paste).not.toHaveBeenCalled()
-    expect(input).not.toHaveBeenCalled()
-  })
-
-  it('streams large pastes as bounded IPC payloads instead of one renderer-blocking write', async () => {
-    const encoder = new TextEncoder()
-    const multibytePrefix = '😀'.repeat(TERMINAL_PASTE_DIRECT_MAX_BYTES / 4 + 1)
-    const largePaste = `${multibytePrefix}\r\nnext\n`
-    const expectedPaste = `${multibytePrefix}\rnext\r`
-    readClipboardText.mockResolvedValueOnce(largePaste)
-    const view = render(<AgentTerminalPreview ptyId="pty-1" />)
-    await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
-    const terminal = terminalHarness.instances[0]!
-    const host = view.container.querySelector<HTMLElement>('.origin-bottom-left')!
-    const terminalInput = document.createElement('input')
-    host.appendChild(terminalInput)
-    terminalInput.focus()
-
-    act(() => emitAppMenuPaste!())
-    const expectedChunks = Math.ceil(
-      encoder.encode(expectedPaste).byteLength / TERMINAL_PASTE_CHUNK_MAX_BYTES
-    )
-    await waitFor(() => expect(input).toHaveBeenCalledTimes(expectedChunks))
-
-    const payloads = input.mock.calls.map(([, data]) => data as string)
-    expect(terminal.paste).not.toHaveBeenCalled()
-    expect(payloads.join('')).toBe(expectedPaste)
-    expect(
-      payloads.every(
-        (payload) => encoder.encode(payload).byteLength <= TERMINAL_PASTE_CHUNK_MAX_BYTES
-      )
-    ).toBe(true)
-  })
-
-  it('closes a bracketed large paste when focus changes between chunks', async () => {
-    readClipboardText.mockResolvedValueOnce('x'.repeat(TERMINAL_PASTE_DIRECT_MAX_BYTES + 1))
-    const view = render(<AgentTerminalPreview ptyId="pty-1" />)
-    await waitFor(() => expect(terminalHarness.instances).toHaveLength(1))
-    const terminal = terminalHarness.instances[0]!
-    terminal.modes.bracketedPasteMode = true
-    const host = view.container.querySelector<HTMLElement>('.origin-bottom-left')!
-    const terminalInput = document.createElement('input')
-    const outsideInput = document.createElement('input')
-    host.appendChild(terminalInput)
-    view.container.appendChild(outsideInput)
-    terminalInput.focus()
-    input.mockImplementationOnce(async () => {
-      outsideInput.focus()
-      return true
-    })
-
-    act(() => emitAppMenuPaste!())
-    await waitFor(() => expect(input).toHaveBeenCalledTimes(2))
-
-    expect(input.mock.calls.map(([, data]) => data)).toEqual([
-      BRACKETED_PASTE_START,
-      BRACKETED_PASTE_END
-    ])
-  })
-
   it('keeps the existing terminal visible while a resync snapshot is captured', async () => {
     let resolveRefresh!: (value: {
       snapshot: { data: string; cols: number; rows: number; seq: number }
@@ -715,6 +610,14 @@ describe('AgentTerminalPreview', () => {
     expect(terminal.dispose).toHaveBeenCalledTimes(1)
     expect(terminalHarness.userInputDispose).toHaveBeenCalledTimes(1)
     expect(unsubscribe).toHaveBeenCalledWith('pty-1')
+  })
+
+  it('does not claim a remote pane closed when no snapshot can exist for it', async () => {
+    connect.mockResolvedValueOnce({ snapshot: null, replay: [] })
+    const view = render(<AgentTerminalPreview ptyId="ssh:devbox@@pty-3" />)
+
+    await waitFor(() => expect(view.getByText(/remote session/)).toBeInTheDocument())
+    expect(view.queryByText(/pane has closed/)).not.toBeInTheDocument()
   })
 
   it('connects a replacement pty after the previous pty was gone', async () => {

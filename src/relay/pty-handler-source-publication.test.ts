@@ -7,10 +7,13 @@ import {
 } from './dispatcher'
 import { encodeJsonRpcFrame, MessageType } from './protocol'
 import { PtyHandler } from './pty-handler'
+import { TEST_PTY_ID_MINT_EPOCH, testPtyId } from './pty-handler-test-harness'
 import { RelayPtySourcePublication } from './relay-pty-source-publication'
 import { SshPtyConsumerSessionAdapter } from './ssh-pty-consumer-session-adapter'
 
 const { mockPtySpawn } = vi.hoisted(() => ({ mockPtySpawn: vi.fn() }))
+
+const PTY_1 = testPtyId(1)
 
 vi.mock('node-pty', () => ({ spawn: mockPtySpawn }))
 
@@ -127,7 +130,7 @@ describe('PtyHandler negotiated source publication', () => {
       },
       endpointIdentity
     )
-    handler = new PtyHandler(dispatcher)
+    handler = new PtyHandler(dispatcher, undefined, TEST_PTY_ID_MINT_EPOCH)
     adapter = new SshPtyConsumerSessionAdapter(dispatcher, 'build-a', undefined, (id) =>
       publication.onCreditAvailable(id)
     )
@@ -221,12 +224,18 @@ describe('PtyHandler negotiated source publication', () => {
     expect(exitFrames()).toHaveLength(1)
   })
 
-  function attachSubscriber(): Buffer[] {
+  async function attachSubscriber(
+    holdDataSettlement?: (settle: (result: SinkWriteSettlement) => void) => boolean
+  ): Promise<Buffer[]> {
     const subscriberWrites: Buffer[] = []
-    dispatcher.attachClient(
+    const clientId = dispatcher.attachClient(
       (data, settle) => {
         subscriberWrites.push(Buffer.from(data))
-        if (notification(data)?.method === 'pty.exit') {
+        const frame = notification(data)
+        if (frame?.method === 'pty.data' && holdDataSettlement?.(settle)) {
+          return true
+        }
+        if (frame?.method === 'pty.exit') {
           // Why: real sockets never settle inside write(); see the primary sink above.
           queueMicrotask(() => settle({ ok: true }))
           return true
@@ -234,8 +243,18 @@ describe('PtyHandler negotiated source publication', () => {
         settle({ ok: true })
         return true
       },
-      { supportsWriteCallback: true }
+      { supportsWriteCallback: true },
+      endpointIdentity
     )
+    dispatcher.feedClient(
+      clientId,
+      requestFrame(20, 'pty.openClient', {
+        protocolVersion: 1,
+        clientInstanceId: 'legacy-subscriber',
+        requestedRole: 'subscriber'
+      })
+    )
+    await vi.advanceTimersByTimeAsync(0)
     return subscriberWrites
   }
 
@@ -248,7 +267,7 @@ describe('PtyHandler negotiated source publication', () => {
   it('never re-delivers the exit to subscribers when a cancel retires the record', async () => {
     await spawn({})
     const spawnResult = writes.map((buffer) => responseResult(buffer, 2)).find(Boolean)!
-    const subscriberWrites = attachSubscriber()
+    const subscriberWrites = await attachSubscriber()
     dataCallback!('prompt')
     await vi.advanceTimersByTimeAsync(8)
 
@@ -293,6 +312,13 @@ describe('PtyHandler negotiated source publication', () => {
     await spawn({})
     const spawnResult = writes.map((buffer) => responseResult(buffer, 2)).find(Boolean)!
     await cancelSourceDelivery(spawnResult)
+    const subscriberWrites = await attachSubscriber((settle) => {
+      if (!holdDataSettlements) {
+        return false
+      }
+      heldDataSettlements.push(settle)
+      return true
+    })
     holdDataSettlements = true
 
     dataCallback!('first')
@@ -311,7 +337,7 @@ describe('PtyHandler negotiated source publication', () => {
     heldDataSettlements[0]({ ok: true })
     await vi.advanceTimersByTimeAsync(8)
 
-    const frames = writes
+    const frames = subscriberWrites
       .map(notification)
       .filter(
         (frame): frame is Notification =>
@@ -351,7 +377,7 @@ describe('PtyHandler negotiated source publication', () => {
     await spawn({})
     const spawnResult = writes.map((buffer) => responseResult(buffer, 2)).find(Boolean)!
     const id = String(spawnResult.id)
-    const subscriberWrites = attachSubscriber()
+    const subscriberWrites = await attachSubscriber()
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
     const publishOwnerExit = vi
       .spyOn(dispatcher, 'tryNotifyPtyExitToClient')
@@ -381,7 +407,7 @@ describe('PtyHandler negotiated source publication', () => {
     await spawn({})
     const spawnResult = writes.map((buffer) => responseResult(buffer, 2)).find(Boolean)!
     const id = String(spawnResult.id)
-    const subscriberWrites = attachSubscriber()
+    const subscriberWrites = await attachSubscriber()
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
     const settleOwnerExit = vi.spyOn(adapter, 'settleExitPublication').mockImplementation(() => {
       throw new Error('exit settlement failed')
@@ -408,7 +434,7 @@ describe('PtyHandler negotiated source publication', () => {
   it('lets a retired record re-target its own exit instead of broadcasting a duplicate', async () => {
     await spawn({})
     const spawnResult = writes.map((buffer) => responseResult(buffer, 2)).find(Boolean)!
-    const subscriberWrites = attachSubscriber()
+    const subscriberWrites = await attachSubscriber()
     const publishExitAfterRetire = vi.fn(() => true)
     handler.setSourcePublication(stubPublication({ accepts: () => false, publishExitAfterRetire }))
 
@@ -631,16 +657,19 @@ describe('PtyHandler negotiated source publication', () => {
 
     expect(mockPtySpawn).toHaveBeenCalledOnce()
     expect(
-      responseResult(replacementWrites.find((buffer) => responseResult(buffer, 4))!, 4)
+      responseResult(
+        replacementWrites.find((buffer) => responseResult(buffer, 4))!,
+        4
+      )
     ).toMatchObject({
-      id: 'pty-1',
+      id: PTY_1,
       incarnationId: expect.any(String),
       sourceActivation: expect.objectContaining({ deliveryToken: expect.any(String) })
     })
     expect(
       replacementWrites.map(notification).find((frame) => frame?.method === 'pty.data')?.params
     ).toMatchObject({
-      id: 'pty-1',
+      id: PTY_1,
       data: 'prompt',
       sourceLengthSu: 6,
       sourceEndSu: 6
@@ -662,7 +691,7 @@ describe('PtyHandler negotiated source publication', () => {
     await vi.advanceTimersByTimeAsync(8)
     expect(projectSpy).toHaveBeenCalledTimes(1)
 
-    handler.handleSourcePublicationCapacity('pty-1')
+    handler.handleSourcePublicationCapacity(PTY_1)
     await vi.advanceTimersByTimeAsync(8)
 
     // Retried projection carries the byte-identical span params.
@@ -680,20 +709,50 @@ describe('PtyHandler negotiated source publication', () => {
     await spawn({})
     const detached: number[] = []
     const healthyWrites: Buffer[] = []
+    let saturateSubscriber = false
     dispatcher.onClientDetached((clientId) => detached.push(clientId))
-    const saturatedId = dispatcher.attachClient(() => false, {
-      supportsWriteCallback: true,
-      writableLength: () => 16 * 1024,
-      writableHighWaterMark: () => 4 * 1024 * 1024
-    })
+    const saturatedId = dispatcher.attachClient(
+      (_data, settle) => {
+        if (saturateSubscriber) {
+          return false
+        }
+        settle({ ok: true })
+        return true
+      },
+      {
+        supportsWriteCallback: true,
+        writableLength: () => 16 * 1024,
+        writableHighWaterMark: () => 4 * 1024 * 1024
+      },
+      endpointIdentity
+    )
     const healthyId = dispatcher.attachClient(
       (data, settle) => {
         healthyWrites.push(Buffer.from(data))
         settle({ ok: true })
         return true
       },
-      { supportsWriteCallback: true }
+      { supportsWriteCallback: true },
+      endpointIdentity
     )
+    dispatcher.feedClient(
+      saturatedId,
+      requestFrame(20, 'pty.openClient', {
+        protocolVersion: 1,
+        clientInstanceId: 'saturated-subscriber',
+        requestedRole: 'subscriber'
+      })
+    )
+    dispatcher.feedClient(
+      healthyId,
+      requestFrame(21, 'pty.openClient', {
+        protocolVersion: 1,
+        clientInstanceId: 'healthy-subscriber',
+        requestedRole: 'subscriber'
+      })
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    saturateSubscriber = true
     const payload = 's'.repeat(16 * 1024)
     let admitted = 0
     while (
@@ -715,5 +774,48 @@ describe('PtyHandler negotiated source publication', () => {
     expect(sourceDataFrames()).toHaveLength(1)
     expect(publication.getDebugSnapshot()).toMatchObject({ sendCommitted: 1 })
     expect(pausePty).not.toHaveBeenCalled()
+  })
+
+  // The reported defect, in the shape measured against the live relay: the client attaches twice
+  // for the same PTY. The first registers a source delivery under the primary client's id; the
+  // second finds `current.clientId === context.clientId`, answers 'existing', and returns NO
+  // replay. Live, every pane on reconnect logged path=existing-delivery and painted nothing.
+  //
+  // A reattach always lands in a NEW terminal — a reconnect bumps tab.generation, which is the
+  // pane's React key, so TerminalPane remounts and the old xterm is disposed with its buffer.
+  describe('a second attach for the same client', () => {
+    async function attach(id: number, params: Record<string, unknown>) {
+      writes = []
+      dispatcher.feed(requestFrame(id, 'pty.attach', { id: PTY_1, ...params }))
+      await vi.advanceTimersByTimeAsync(0)
+      return writes.map((buffer) => responseResult(buffer, id)).find(Boolean)
+    }
+
+    beforeEach(async () => {
+      await spawn({})
+      dataCallback!('scrollback-that-must-survive')
+      await vi.advanceTimersByTimeAsync(10)
+      await attach(10, { suppressReplayNotification: true })
+    })
+
+    it('replays the scrollback when the client says it needs it', async () => {
+      const second = await attach(11, {
+        suppressReplayNotification: true,
+        requireReplay: true
+      })
+
+      expect(second, 'second attach returned no response').toBeTruthy()
+      expect(second!.replay).toContain('scrollback-that-must-survive')
+    })
+
+    // The early return is right for a duplicate attach from a client that IS still receiving the
+    // stream; only a client that has thrown its terminal away should ask. Pinned so the fix stays
+    // opt-in and cannot start double-rendering for callers that never asked.
+    it('still sends nothing when the client does not ask', async () => {
+      const second = await attach(12, { suppressReplayNotification: true })
+
+      expect(second, 'second attach returned no response').toBeTruthy()
+      expect(second!.replay).toBeUndefined()
+    })
   })
 })

@@ -3,13 +3,14 @@ import { resolve } from 'node:path'
 import { defineConfig, type UserConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { createBootstrapFatalExitBanner } from './build-plugins/bootstrap-fatal-exit-banner'
-import { createPlainNodeEntryGuardPlugin } from './build-plugins/plain-node-entry-guard'
+import { createBootstrapFatalExitBanner } from './config/build-plugins/bootstrap-fatal-exit-banner'
+import { createPlainNodeEntryGuardPlugin } from './config/build-plugins/plain-node-entry-guard'
 import packageJson from './package.json' with { type: 'json' }
 
 const BUNDLED_MAIN_DEPENDENCIES = new Set([
   '@xterm/headless',
   '@xterm/addon-serialize',
+  'psl',
   // Why: Windows NSIS deploys app.asar before external resources; bootstrap must
   // not race the later resources/node_modules copy.
   'zod'
@@ -193,6 +194,14 @@ function createMainBootstrapPlugin() {
 export const electronViteConfig: UserConfig = {
   main: {
     build: {
+      // Why: 'esbuild' makes rolldown disable its own minifier and re-print every
+      // chunk through esbuild, which is undeclared here and only resolves via
+      // pnpm hoisting. 'oxc' is rolldown's in-process minifier.
+      minify: 'oxc',
+      // Why: 'hidden' emits .js.map with no sourceMappingURL, so the shipped
+      // bundle never references maps that packaging strips out. Release CI
+      // uploads them so minified crash traces stay decodable.
+      sourcemap: 'hidden',
       // Why: daemon-entry.js is asar-unpacked so child_process.fork() can
       // execute it from disk. Node's module resolution from the unpacked
       // directory cannot reach into app.asar; startup-critical pure JS must
@@ -206,6 +215,9 @@ export const electronViteConfig: UserConfig = {
         external: isExternalMainModule,
         input: {
           index: resolve('src/main/index.ts'),
+          // Why: sandboxed webview preloads cannot load Rollup helper chunks.
+          'browser-window-close-preload': resolve('src/preload/browser-window-close.ts'),
+          'doc-preview-link-preload': resolve('src/preload/doc-preview-link.ts'),
           'daemon-entry': resolve('src/main/daemon/daemon-entry.ts'),
           'plugin-host-entry': resolve('src/main/plugins/plugin-host-entry.ts'),
           'computer-sidecar': resolve('src/main/computer/sidecar-entry.ts'),
@@ -213,6 +225,20 @@ export const electronViteConfig: UserConfig = {
           'warp-theme-parser-worker': resolve('src/main/warp-themes/warp-theme-parser-worker.ts'),
           'session-scanner-opencode-sqlite-worker-entry': resolve(
             'src/main/ai-vault/session-scanner-opencode-sqlite-worker-entry.ts'
+          ),
+          'session-scanner-worker-entry': resolve(
+            'src/main/ai-vault/session-scanner-worker-entry.ts'
+          ),
+          'session-scanner-service-entry': resolve(
+            'src/main/ai-vault/session-scanner-service-entry.ts'
+          ),
+          'wsl-transcript-fs-process-entry': resolve(
+            'src/main/native-chat/wsl-transcript-fs-process-entry.ts'
+          ),
+          // Why: libuv spawns processes inline on the calling loop, so the port
+          // scan's probe commands run on a worker thread instead of the UI one.
+          'port-scan-command-worker-entry': resolve(
+            'src/main/ports/port-scan-command-worker-entry.ts'
           ),
           // Why: forked with ELECTRON_RUN_AS_NODE so @parcel/watcher faults
           // can't take down the main process (issue #7547).
@@ -222,16 +248,13 @@ export const electronViteConfig: UserConfig = {
           'main-thread-hang-watchdog-entry': resolve(
             'src/main/hang-watchdog/main-thread-hang-watchdog-entry.ts'
           ),
-          // Why: run under ELECTRON_RUN_AS_NODE while the caller blocks on
-          // spawnSync — codex app-server trust grants need a live event loop
-          // but must finish before a Codex pane launch proceeds.
-          'codex/codex-app-server-grant-entry': resolve(
-            'src/main/codex/codex-app-server-grant-entry.ts'
-          ),
           // Why: electron-vite cleans out/main in dev. The dev CLI imports
           // this path for `orca agent hooks ...`, so it must survive rebuilds.
           'agent-hooks/managed-agent-hook-controls': resolve(
             'src/main/agent-hooks/managed-agent-hook-controls.ts'
+          ),
+          'codex/managed-home-shell-preflight': resolve(
+            'src/main/codex/managed-home-shell-preflight.ts'
           ),
           // Why: account import mutates the user's macOS Keychain from the CLI.
           'claude-accounts/keychain': resolve('src/main/claude-accounts/keychain.ts')
@@ -268,7 +291,7 @@ export const electronViteConfig: UserConfig = {
   preload: {
     build: {
       externalizeDeps: {
-        exclude: ['@electron-toolkit/preload']
+        exclude: ['@electron-toolkit/preload', 'zod']
       }
     }
   },
@@ -286,6 +309,7 @@ export const electronViteConfig: UserConfig = {
     build: {
       manifest: true,
       modulePreload: { polyfill: true },
+      minify: 'oxc',
       target: 'es2020',
       // Why: the pop-out dashboard is a second top-level window with its own
       // React root. It gets its own HTML entry so it can boot independently of

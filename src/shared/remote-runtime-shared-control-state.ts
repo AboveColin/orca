@@ -10,6 +10,7 @@ import type {
   SharedControlReadyWaiter
 } from './remote-runtime-shared-control-types'
 import { getSubscriptionId, isEndResult } from './remote-runtime-shared-control-protocol'
+import { withReconnectJitter } from './reconnect-jitter'
 import { tagRuntimeSubscriptionReplayResponse } from './runtime-subscription-replay'
 
 export function buildSharedControlDiagnostics(args: {
@@ -18,18 +19,17 @@ export function buildSharedControlDiagnostics(args: {
   pendingRequestCount: number
   subscriptionCount: number
   reconnectAttempt: number
-  lastConnectedAt: number | null
-  lastClose: { code: number; reason: string } | null
-  lastError: string | null
+  diag: Pick<
+    RemoteRuntimeSharedConnectionDiagnostics,
+    'lastConnectedAt' | 'lastClose' | 'lastError'
+  >
 }): RemoteRuntimeSharedConnectionDiagnostics {
   return {
     state: args.reconnecting ? 'reconnecting' : args.state,
     pendingRequestCount: args.pendingRequestCount,
     subscriptionCount: args.subscriptionCount,
     reconnectAttempt: args.reconnectAttempt,
-    lastConnectedAt: args.lastConnectedAt,
-    lastClose: args.lastClose,
-    lastError: args.lastError
+    ...args.diag
   }
 }
 
@@ -75,22 +75,6 @@ export function refreshSharedControlPendingRequestTimeouts(
     const timeout = pending.timeout as ReturnType<typeof setTimeout> & { refresh?: () => void }
     timeout.refresh?.()
   }
-}
-
-export function waitForSharedControlReady(ready: Promise<void>, timeoutMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(remoteRuntimeUnavailableError()), timeoutMs)
-    void ready.then(
-      () => {
-        clearTimeout(timeout)
-        resolve()
-      },
-      (error) => {
-        clearTimeout(timeout)
-        reject(error)
-      }
-    )
-  })
 }
 
 export function rejectAllSharedControlPendingRequests(
@@ -222,11 +206,4 @@ export function scheduleSharedControlReconnect(args: {
     timer.unref()
   }
   return { timer, reconnectAttempt: args.reconnectAttempt + 1 }
-}
-
-function withReconnectJitter(delayMs: number): number {
-  // Why: when a remote host restarts, all passive subscriptions reconnect
-  // together. A small one-sided jitter avoids synchronized retry spikes.
-  const jitterMs = Math.floor(delayMs * 0.2 * Math.random())
-  return delayMs + jitterMs
 }

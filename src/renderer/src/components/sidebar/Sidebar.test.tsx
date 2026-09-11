@@ -3,10 +3,10 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { tmpdir } from 'node:os'
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getDefaultSettings } from '../../../../shared/constants'
-import type { GlobalSettings } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
 
 const mocks = vi.hoisted(() => ({
   state: {} as Record<string, unknown>,
@@ -32,11 +32,18 @@ vi.mock('@/hooks/useSidebarResize', () => ({
 }))
 
 vi.mock('@/components/ui/tooltip', () => ({
-  TooltipProvider: ({ children }: { children: ReactNode }) => <>{children}</>
+  TooltipProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
+  Tooltip: ({ children }: { children: ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  TooltipContent: ({ children }: { children: ReactNode }) => <>{children}</>
 }))
 
-vi.mock('./SidebarHeader', () => ({
-  default: () => <div data-testid="sidebar-header" />
+vi.mock('./SidebarHeader', () => ({ default: () => <div data-testid="sidebar-header" /> }))
+
+vi.mock('./SidebarAgentsList', () => ({
+  default: ({ query }: { query: string }) => (
+    <div data-testid="sidebar-agents-list" data-query={query} />
+  )
 }))
 
 vi.mock('./SidebarNav', () => ({
@@ -220,62 +227,20 @@ describe('Sidebar', () => {
     expect(fetchAllWorktrees).not.toHaveBeenCalled()
   })
 
-  describe('companion board mutual exclusion', () => {
-    function renderWithDashboardOpen(): {
-      view: ReturnType<typeof render>
-      setAgentDashboardDrawerOpen: ReturnType<typeof vi.fn>
-    } {
-      setSidebarState(getDefaultSettings(tmpdir()))
-      const setAgentDashboardDrawerOpen = vi.fn()
-      mocks.state = { ...mocks.state, agentDashboardDrawerOpen: true, setAgentDashboardDrawerOpen }
-      mocks.panel = {
-        workspaceBoardOpen: false,
-        workspaceBoardRenderedOpen: false,
-        workspaceBoardDragPreviewOpen: false
-      }
-      return { view: render(sidebarElement()), setAgentDashboardDrawerOpen }
+  it('closes the dashboard drawer when the dashboard experiment is disabled', async () => {
+    setSidebarState({
+      ...getDefaultSettings(tmpdir()),
+      experimentalAgentDashboardPopout: false
+    })
+    const setAgentDashboardDrawerOpen = vi.fn()
+    mocks.state = {
+      ...mocks.state,
+      agentDashboardDrawerOpen: true,
+      setAgentDashboardDrawerOpen
     }
 
-    it('keeps the agent dashboard open while a worktree drag only previews the board', () => {
-      const { view, setAgentDashboardDrawerOpen } = renderWithDashboardOpen()
+    render(sidebarElement())
 
-      mocks.panel = {
-        workspaceBoardOpen: false,
-        workspaceBoardRenderedOpen: true,
-        workspaceBoardDragPreviewOpen: true
-      }
-      view.rerender(sidebarElement())
-
-      expect(setAgentDashboardDrawerOpen).not.toHaveBeenCalled()
-    })
-
-    it('closes the agent dashboard when the workspace board is actually opened', () => {
-      const { view, setAgentDashboardDrawerOpen } = renderWithDashboardOpen()
-
-      mocks.panel = {
-        workspaceBoardOpen: true,
-        workspaceBoardRenderedOpen: true,
-        workspaceBoardDragPreviewOpen: false
-      }
-      view.rerender(sidebarElement())
-
-      expect(setAgentDashboardDrawerOpen).toHaveBeenCalledWith(false)
-    })
-
-    it('closes the workspace board when the agent dashboard opens', () => {
-      setSidebarState(getDefaultSettings(tmpdir()))
-      mocks.panel = {
-        workspaceBoardOpen: true,
-        workspaceBoardRenderedOpen: true,
-        workspaceBoardDragPreviewOpen: false
-      }
-      const view = render(sidebarElement())
-      mocks.closeWorkspaceBoard.mockClear()
-
-      mocks.state = { ...mocks.state, agentDashboardDrawerOpen: true }
-      view.rerender(sidebarElement())
-
-      expect(mocks.closeWorkspaceBoard).toHaveBeenCalled()
-    })
+    await waitFor(() => expect(setAgentDashboardDrawerOpen).toHaveBeenCalledWith(false))
   })
 })

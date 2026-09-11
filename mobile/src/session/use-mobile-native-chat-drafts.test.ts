@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NativeChatMessage } from '../../../src/shared/native-chat-types'
 import { useMobileNativeChatDrafts } from './use-mobile-native-chat-drafts'
 
@@ -30,10 +30,6 @@ describe('useMobileNativeChatDrafts', () => {
   let renderer: ReactTestRenderer | null = null
   let state: DraftState | null = null
 
-  beforeEach(() => {
-    globalThis.IS_REACT_ACT_ENVIRONMENT = true
-  })
-
   afterEach(() => {
     act(() => renderer?.unmount())
     renderer = null
@@ -46,7 +42,8 @@ describe('useMobileNativeChatDrafts', () => {
     messages = [],
     launchDraft = null,
     chatActive = true,
-    transcriptLoading = false
+    transcriptLoading = false,
+    transcriptSettled = !transcriptLoading
   }: {
     tabId: string
     sessionId?: string | null
@@ -54,6 +51,7 @@ describe('useMobileNativeChatDrafts', () => {
     launchDraft?: string | null
     chatActive?: boolean
     transcriptLoading?: boolean
+    transcriptSettled?: boolean
   }): null {
     state = useMobileNativeChatDrafts({
       hostId: 'host',
@@ -63,26 +61,16 @@ describe('useMobileNativeChatDrafts', () => {
       messages,
       launchDraft,
       chatActive,
-      transcriptLoading
+      transcriptLoading,
+      transcriptSettled
     })
     return null
   }
 
   async function mount(tabId: string): Promise<void> {
-    const original = console.error
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation((...args) => {
-      if (typeof args[0] === 'string' && args[0].includes('react-test-renderer is deprecated')) {
-        return
-      }
-      original(...args)
+    await act(async () => {
+      renderer = create(createElement(Harness, { tabId }))
     })
-    try {
-      await act(async () => {
-        renderer = create(createElement(Harness, { tabId }))
-      })
-    } finally {
-      consoleSpy.mockRestore()
-    }
   }
 
   async function switchTo(tabId: string): Promise<void> {
@@ -127,6 +115,20 @@ describe('useMobileNativeChatDrafts', () => {
     expect(state?.composerText).toBe('')
   })
 
+  it('tracks every composer mutation with a stable route-owned generation', async () => {
+    await mount('a')
+    const getter = state!.getComposerEditGeneration
+    const initialGeneration = getter()
+
+    act(() => state?.setComposerText('typed'))
+    expect(getter()).toBe(initialGeneration + 1)
+
+    await switchTo('b')
+    expect(state?.getComposerEditGeneration).toBe(getter)
+    act(() => state?.setComposerText((current) => `${current} dictated`))
+    expect(getter()).toBe(initialGeneration + 2)
+  })
+
   it('restores the text on a definite rejection', async () => {
     await mount('a')
     act(() => state?.setComposerText('ping'))
@@ -158,6 +160,26 @@ describe('useMobileNativeChatDrafts', () => {
     expect(state?.composerText).toBe('newer edit')
   })
 
+  it('preserves an intentional clear after a newer edit while a rejection is pending', async () => {
+    await mount('a')
+    act(() => state?.setComposerText('ping'))
+    const origin = state?.captureSendOrigin('ping')
+    act(() => {
+      if (origin) {
+        state?.clearDraftForSend(origin, 'ping')
+      }
+    })
+    act(() => state?.setComposerText('newer edit'))
+    act(() => state?.setComposerText(''))
+    act(() => {
+      if (origin) {
+        state?.restoreRejectedDraft(origin, 'ping')
+      }
+    })
+
+    expect(state?.composerText).toBe('')
+  })
+
   it('restores a rejected send onto its originating tab only', async () => {
     await mount('a')
     act(() => state?.setComposerText('from a'))
@@ -169,12 +191,13 @@ describe('useMobileNativeChatDrafts', () => {
     })
 
     await switchTo('b')
+    act(() => state?.setComposerText('from b'))
     act(() => {
       if (originA) {
         state?.restoreRejectedDraft(originA, 'from a')
       }
     })
-    expect(state?.composerText).toBe('')
+    expect(state?.composerText).toBe('from b')
 
     await switchTo('a')
     expect(state?.composerText).toBe('from a')
@@ -269,6 +292,7 @@ describe('useMobileNativeChatDrafts', () => {
       )
     )
     expect(state?.pending).toEqual([])
+    expect(state?.imagePreviewsByMessageId).toEqual({ u1: ['file:///a.jpg'] })
   })
 
   it("keeps an image-only echo when an unrelated text send's echo lands", async () => {
@@ -330,8 +354,8 @@ describe('useMobileNativeChatDrafts', () => {
     })
     expect(state?.pending).toHaveLength(1)
 
-    // Claude echoes a captioned image send as two turns: the source marker and
-    // the caption prefixed with `[Image #1] ` — the pending must still match.
+    // Claude echoes a captioned image send as a source turn plus a caption
+    // carrying `[Image #1]`; the pending must still match.
     await act(async () =>
       renderer?.update(
         createElement(Harness, {
@@ -345,6 +369,60 @@ describe('useMobileNativeChatDrafts', () => {
       )
     )
     expect(state?.pending).toEqual([])
+    expect(state?.imagePreviewsByMessageId).toEqual({ u2: ['file:///a.jpg'] })
+  })
+
+  it('reconciles a captioned image echo with a trailing [Image #N] marker', async () => {
+    await mount('a')
+    await act(async () =>
+      renderer?.update(
+        createElement(Harness, { tabId: 'a', messages: [assistantTextMessage('a1', 'hi')] })
+      )
+    )
+    const origin = state?.captureSendOrigin('look at this')
+    act(() => {
+      if (origin) {
+        state?.acceptSend(origin, 'look at this', ['file:///a.jpg'])
+      }
+    })
+    expect(state?.pending).toHaveLength(1)
+
+    await act(async () =>
+      renderer?.update(
+        createElement(Harness, {
+          tabId: 'a',
+          messages: [
+            assistantTextMessage('a1', 'hi'),
+            userTextMessage('u1', '[Image: source: /tmp/a.png]'),
+            userTextMessage('u2', 'look at this[Image #1]')
+          ]
+        })
+      )
+    )
+    expect(state?.pending).toEqual([])
+    expect(state?.imagePreviewsByMessageId).toEqual({ u2: ['file:///a.jpg'] })
+  })
+
+  it('hands a marker-only image preview to the authoritative user bubble', async () => {
+    await mount('a')
+    const origin = state?.captureSendOrigin('')
+    act(() => {
+      if (origin) {
+        state?.acceptSend(origin, '', ['file:///a.jpg'])
+      }
+    })
+
+    await act(async () =>
+      renderer?.update(
+        createElement(Harness, {
+          tabId: 'a',
+          messages: [userTextMessage('u1', '[Image #1]')]
+        })
+      )
+    )
+
+    expect(state?.pending).toEqual([])
+    expect(state?.imagePreviewsByMessageId).toEqual({ u1: ['file:///a.jpg'] })
   })
 
   it('does not reconcile a repeated send against an older identical turn', async () => {
@@ -398,6 +476,20 @@ describe('useMobileNativeChatDrafts', () => {
     })
 
     expect(state?.composerText).toBe('new edit')
+  })
+
+  it('does not erase a whitespace-only newer edit when an older send clears', async () => {
+    await mount('a')
+    act(() => state?.setComposerText('/clear'))
+    const origin = state?.captureSendOrigin('/clear')
+    act(() => state?.setComposerText(' /clear'))
+    act(() => {
+      if (origin) {
+        state?.clearDraftForSend(origin, '/clear')
+      }
+    })
+
+    expect(state?.composerText).toBe(' /clear')
   })
 
   it('stays quiet when an unconfirmed send lands in the transcript', async () => {
@@ -722,21 +814,59 @@ describe('useMobileNativeChatDrafts', () => {
     }
   })
 
-  it('accepts and clears the first send before a provider session id exists', async () => {
+  it('preserves first-send images through session assignment and transcript replacement', async () => {
     await mount('a')
     await act(async () => renderer?.update(createElement(Harness, { tabId: 'a', sessionId: null })))
-    act(() => state?.setComposerText('start the session'))
+    const images = ['file:///a.jpg', 'file:///b.jpg', 'file:///c.jpg']
+    act(() => state?.setComposerText('look'))
 
-    const origin = state?.captureSendOrigin('start the session')
+    const origin = state?.captureSendOrigin('look')
     expect(origin).toMatchObject({ pendingKey: null })
     act(() => {
       if (origin) {
-        state?.clearDraftForSend(origin, 'start the session')
-        state?.acceptSend(origin, 'start the session')
+        state?.clearDraftForSend(origin, 'look')
+        state?.acceptSend(origin, 'look', images)
       }
     })
 
     expect(state?.composerText).toBe('')
+    expect(state?.pending.map((pending) => pending.images)).toEqual([images])
+
+    await act(async () =>
+      renderer?.update(createElement(Harness, { tabId: 'a', sessionId: 'assigned' }))
+    )
+    expect(state?.pending.map((pending) => pending.images)).toEqual([images])
+
+    await act(async () =>
+      renderer?.update(
+        createElement(Harness, {
+          tabId: 'a',
+          sessionId: 'assigned',
+          messages: [
+            userTextMessage('source-1', '[Image: source: /tmp/a.png]'),
+            userTextMessage('source-2', '[Image: source: /tmp/b.png]'),
+            userTextMessage('source-3', '[Image: source: /tmp/c.png]')
+          ]
+        })
+      )
+    )
+    expect(state?.pending.map((pending) => pending.images)).toEqual([images])
+
+    await act(async () =>
+      renderer?.update(
+        createElement(Harness, {
+          tabId: 'a',
+          sessionId: 'assigned',
+          messages: [
+            userTextMessage('source-1', '[Image: source: /tmp/a.png]'),
+            userTextMessage('source-2', '[Image: source: /tmp/b.png]'),
+            userTextMessage('source-3', '[Image: source: /tmp/c.png]'),
+            userTextMessage('prompt', '[Image #1] [Image #2] [Image #3] look')
+          ]
+        })
+      )
+    )
     expect(state?.pending).toEqual([])
+    expect(state?.imagePreviewsByMessageId).toEqual({ prompt: images })
   })
 })
