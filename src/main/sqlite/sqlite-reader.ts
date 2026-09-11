@@ -188,6 +188,12 @@ export class SqliteDatabaseReader {
     return statement
   }
 
+  // rowid, _rowid_ and oid all name the internal rowid unless a table declares its own column
+  // with one of those names, which shadows that one alias only. Preferring an alias the table
+  // hasn't declared keeps paging on the internal rowid instead of a user column that need not
+  // be unique.
+  private static readonly ROWID_ALIASES = ['rowid', '_rowid_', 'oid']
+
   // Paging needs a total order: without it SQLite may serve one chunk from an index and the next from the table.
   private orderBy(tableName: string): string {
     const cached = this.orderClauses.get(tableName)
@@ -195,13 +201,26 @@ export class SqliteDatabaseReader {
       return cached
     }
     const quoted = quoteIdentifier(tableName)
-    let clause: string
-    try {
-      this.db.prepare(`select rowid from ${quoted} limit 0`)
-      clause = 'rowid'
-    } catch {
-      // WITHOUT ROWID tables have no rowid; their primary key is the row order.
-      const keyColumns = (this.db.prepare(`pragma table_xinfo(${quoted})`).all() as ColumnRow[])
+    const declaredColumns = this.db.prepare(`pragma table_xinfo(${quoted})`).all() as ColumnRow[]
+    const declaredNames = new Set(declaredColumns.map((column) => column.name.toLowerCase()))
+    const unshadowedAlias = SqliteDatabaseReader.ROWID_ALIASES.find(
+      (alias) => !declaredNames.has(alias)
+    )
+    let clause: string | null = null
+    if (unshadowedAlias !== undefined) {
+      try {
+        this.db.prepare(`select ${unshadowedAlias} from ${quoted} limit 0`)
+        clause = unshadowedAlias
+      } catch {
+        // No alias resolves: a WITHOUT ROWID table, or a virtual table with no rowid at all.
+        clause = null
+      }
+    }
+    if (clause === null) {
+      // WITHOUT ROWID tables have no rowid; their primary key is the row order. A table whose
+      // declared columns shadow all three rowid aliases also lands here even if it does have one,
+      // since none of them are reachable by name any more.
+      const keyColumns = declaredColumns
         .filter((column) => column.pk > 0)
         .sort((a, b) => a.pk - b.pk)
         .map((column) => quoteIdentifier(column.name))

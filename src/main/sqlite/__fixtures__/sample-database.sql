@@ -63,3 +63,12 @@ CREATE TABLE docs_archive (note TEXT);
 INSERT INTO docs_archive VALUES ('kept');
 
 INSERT INTO settings VALUES ('theme', 'dark'), ('locale', 'nl');
+
+-- A user column literally named "rowid" (not INTEGER PRIMARY KEY) shadows the rowid alias for
+-- this table only; the column itself is not unique, so paging by it would not give a total order.
+CREATE TABLE shadow_rowid (
+    rowid TEXT,
+    label TEXT
+);
+INSERT INTO shadow_rowid (rowid, label) VALUES
+    ('dup', 'first'), ('dup', 'second'), ('dup', 'third');

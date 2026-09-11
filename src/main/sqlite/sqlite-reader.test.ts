@@ -141,6 +141,17 @@ describe('SqliteDatabaseReader', () => {
     })
   })
 
+  it('pages by the internal rowid when a user column shadows the "rowid" alias', () => {
+    withFixture((reader) => {
+      // shadow_rowid declares its own non-unique `rowid` text column, so ordering by that name
+      // would not give a total order. `_rowid_` and `oid` are unshadowed, so one of those must be
+      // used instead, which preserves insertion order.
+      const page = reader.readTablePage('shadow_rowid', 0, 10)
+      expect(page.columns).toEqual(['rowid', 'label'])
+      expect(page.rows.map((row) => row[1]?.text)).toEqual(['first', 'second', 'third'])
+    })
+  })
+
   it('names the missing table instead of building a query from it', () => {
     withFixture((reader) => {
       expect(() => reader.readTablePage('nope"; drop table people; --', 0, 1)).toThrow(
